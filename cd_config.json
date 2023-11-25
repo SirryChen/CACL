@@ -1,0 +1,22 @@
+{
+  "epoch": 128,
+  "warm_up_epoch": 16,
+  "user_feature_dim": 45,
+  "cd_hidden_dim": 64,
+  "cd_output_dim": 32,
+  "lr": 0.0005,
+  "beta": 0.01,
+  "gamma": 1.0,
+  "val_ratio": 0.1,
+  "s_rec": 2,
+  "lamb": 0.1,
+  "max_error_times": 3,
+  "fastGAE_threshold": 10000,
+  "relation_edge": [
+        ["user", "followers", "user"],
+        ["user", "following", "user"],
+        ["user", "own", "list"],
+        ["user", "pinned", "tweet"],
+        ["user", "post", "tweet"]
+    ]
+}
