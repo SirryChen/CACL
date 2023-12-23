@@ -29,9 +29,9 @@ class GCNModel(nn.Module):
         self.ConvList = nn.ModuleList()
         for _ in range(num_layer - 1):
             self.ConvList.append(HeteroConv({edge_type: GCNConv(-1, embedding_dim)
-                                         for edge_type in metadata[1]}, aggr='sum'))
+                                             for edge_type in metadata[1]}, aggr='sum'))
         self.ConvList.append(HeteroConv({edge_type: GCNConv(-1, embedding_dim)
-                                     for edge_type in metadata[1]}, aggr='sum'))
+                                         for edge_type in metadata[1]}, aggr='sum'))
 
         self.linear_relu_output1 = nn.Sequential(nn.Linear(embedding_dim, embedding_dim),
                                                  nn.LeakyReLU(), nn.Dropout(args.dropout))

@@ -3,127 +3,98 @@ import random
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as func
-from torch_geometric.nn.conv import HGTConv
+import networkx as nx
+import scipy.sparse as sp
+from community import best_partition
 from torch_geometric.data import HeteroData
-from torch_geometric.nn.conv import HeteroConv, HGTConv, RGCNConv, FastRGCNConv, GATConv, SAGEConv
-from sklearn.metrics import confusion_matrix, roc_auc_score, average_precision_score
+from sklearn.metrics import confusion_matrix, roc_auc_score, average_precision_score, f1_score
 from CD_utils import load_user_graph, louvain_cluster, preprocess_adj, preprocess_degree, pairwise_distance, \
-    clusters, init_weight, node_sample
+    clusters, init_weight
 from utils import pr_drop_weights, drop_edge_weighted, compress_graph
 
 
-def preprocess_graph(graph: HeteroData, cd_config: dict, graph_type='train'):
+def preprocess_graph(graph: HeteroData):
+    # extract user graph
     torch_user_adj, user_feature, num_users = load_user_graph(graph)
-    s_adj_louvain, num_communities, partition = louvain_cluster(torch_user_adj, cd_config['s_rec'])
-    o_normalized_adj = preprocess_adj(torch_user_adj, num_users)
-    s_normalized_adj = preprocess_adj(torch_user_adj + cd_config['lamb'] * s_adj_louvain, num_users)
-    if num_users > cd_config['fastGAE_threshold'] and graph_type == 'train':
-        # 节点个数过多时抽样，便于计算重构损失
-        fast_gae = True
-        sample_nodes, sample_adj = node_sample(torch_user_adj, cd_config['fastGAE_threshold'])
-        sample_num_edge = sample_adj.values().size(0)
-        sample_num_user = len(sample_nodes)
-        # 计算损失权重
-        pos_weights = torch.tensor(float(sample_num_user * sample_num_user - sample_num_edge) / sample_num_edge)
-        # 稀疏的度矩阵
-        deg_matrix_sparse = preprocess_degree(sample_adj)
-    else:
-        fast_gae = False
-        sample_nodes = None
-        sample_adj = None
-        num_edges = torch_user_adj.values().size(0)
-        pos_weights = torch.tensor(float(num_users * num_users - num_edges) / num_edges)
-        deg_matrix_sparse = preprocess_degree(torch_user_adj)
-    adj_ = (torch_user_adj, sample_adj, o_normalized_adj, s_normalized_adj)
-    param_ = (num_communities, num_users, pos_weights, fast_gae)
-    return adj_, param_, user_feature, sample_nodes, deg_matrix_sparse
+    normalized_adj = preprocess_adj(torch_user_adj, num_users)
+    deg_matrix_sparse = preprocess_degree(torch_user_adj)
+    num_edges = torch_user_adj.values().size(0)
+    pos_weights = torch.tensor(float(num_users * num_users - num_edges) / num_edges)
+
+    # louvain community detection
+    sp_user_adj = sp.coo_matrix((torch_user_adj.values(), (torch_user_adj.indices()[0], torch_user_adj.indices()[1])),
+                                shape=torch_user_adj.shape)
+    partition = best_partition(nx.from_scipy_sparse_array(sp_user_adj))
+    communities_louvain = list(partition.values())
+    num_communities = max(communities_louvain) + 1
+
+    adj_ = (normalized_adj, torch_user_adj)
+    param_ = (num_communities, pos_weights)
+
+    return user_feature, adj_, deg_matrix_sparse, param_
 
 
 class ModCDModel(nn.Module):
     """
     社区检测模型接口
     """
-    def __init__(self, input_dim, args, cd_config, cd_device, metadata, pretrain=False):
+    def __init__(self, args, cd_config, cd_device, pretrain=False, ensure_comm_num=False):
         super(ModCDModel, self).__init__()
-        self.cd_encoder_decoder = CDEncoderDecoder(input_dim, args.encoder_hidden_channel, args.output_dim, metadata,
-                                                   args.basic_model)
+        self.cd_encoder_decoder = CDEncoderDecoder(args.encoder_hidden_channel, args.output_dim, args)
         self.cd_config = cd_config
         self.pretrain = pretrain
+        self.ensure_comm_num = ensure_comm_num
         self.cluster_choice = args.cluster
         self.device = cd_device
-        self.torch_user_adj = None
-        self.normalized_adj = None
+        self.origin_adj = None
         self.deg_matrix_sparse = None
-        self.clusters = None
-        self.num_users = None
+        self.reconstruct = None
+        self.clusters_distance = None
         self.pos_weights = None
-        self.reconstructions = None
-        self.sample_adj = None
-        self.fast_gae = False
-        self.sample_nodes = None
+        self.node_emb = None
 
-    def forward(self, graph):
+    def forward(self, graph: HeteroData):
         """
         @param graph: 完整图
         @return: 增强的边，划分的子图
         """
-        # 提取用户子图
-        adj_, param_, user_feature, self.sample_nodes, self.deg_matrix_sparse = preprocess_graph(graph, self.cd_config)
-        self.torch_user_adj, self.sample_adj, o_normalized_adj, s_normalized_adj = adj_
-        num_communities, self.num_users, self.pos_weights, self.fast_gae = param_
-
-        # 传入社区检测模型
-        user_feature = user_feature.to(self.device)
-        self.torch_user_adj = self.torch_user_adj.to(self.device)
-        s_normalized_adj = s_normalized_adj.to(self.device)
-        o_normalized_adj = o_normalized_adj.to(self.device)
-        if self.fast_gae:
-            self.sample_nodes = self.sample_nodes.to(self.device)
-            self.sample_adj = self.sample_adj.to(self.device)
-
-        self.reconstructions, self.clusters, emb = self.cd_encoder_decoder(
-            user_feature, s_normalized_adj, o_normalized_adj, self.cd_config['gamma'], self.fast_gae, self.sample_nodes)
-
+        user_feature, adj, self.deg_matrix_sparse, param = preprocess_graph(graph)
+        normalized_adj, self.origin_adj = adj
+        num_communities, self.pos_weights = param
+        self.reconstruct, self.clusters_distance, self.node_emb = self.cd_encoder_decoder(user_feature.to(self.device),
+                                                                                          normalized_adj.to(self.device),
+                                                                                          self.cd_config['gamma'])
         if not self.pretrain:
             new_edge_index = []
-            edge_index = self.torch_user_adj.indices()
+            edge_index = self.origin_adj.indices()
             edge_number = edge_index.size(1)
-            edge_set = set(tuple(edge) for edge in self.torch_user_adj.indices().t().tolist())
+            edge_set = set(tuple(edge) for edge in self.origin_adj.indices().t().tolist())
 
-            if self.fast_gae:
-                for i, j in (torch.sigmoid(self.reconstructions) > 0.5).nonzero().tolist():
-                    if (self.sample_nodes[i], self.sample_nodes[j]) not in edge_set:
-                        new_edge_index.append([self.sample_nodes[i], self.sample_nodes[j]])
-            else:
-                for i, j in (torch.sigmoid(self.reconstructions) > 0.5).nonzero().tolist():
-                    if (i, j) not in edge_set:
-                        new_edge_index.append([i, j])
+            for i, j in (torch.sigmoid(self.reconstruct) > 0.5).nonzero().tolist():
+                if (i, j) not in edge_set:
+                    new_edge_index.append([i, j])
             new_edge_num = min(edge_number//10, len(new_edge_index))
             new_edge_index = torch.tensor(random.sample(new_edge_index, new_edge_num)).t()
 
             # NOTE:返回实际使用的社区分类情况，以及用于图增强的连接预测
-            k_partition = clusters(emb.detach().to('cpu'), edge_index.to('cpu'), num_communities, self.cluster_choice)
+            k_partition = clusters(self.node_emb.detach().to('cpu'), edge_index.to('cpu'),
+                                   num_communities, self.cluster_choice, self.ensure_comm_num)
 
             return new_edge_index, k_partition
 
     def compute_loss(self):
-        if self.fast_gae:
-            return cd_loss(self.reconstructions, self.sample_adj, self.deg_matrix_sparse.to(self.device),
-                           self.clusters, self.pos_weights, self.cd_config['beta'])
-        else:
-            return cd_loss(self.reconstructions, self.torch_user_adj, self.deg_matrix_sparse.to(self.device),
-                           self.clusters, self.pos_weights, self.cd_config['beta'])
+        return cd_loss(self.reconstruct, self.origin_adj.to(self.device), self.deg_matrix_sparse.to(self.device),
+                       self.clusters_distance, self.pos_weights.to(self.device), self.cd_config['beta'])
 
     def compute_score(self):
         scores_dict = {}
-        if self.fast_gae:
-            label_ = self.sample_adj.to_dense().flatten().to('cpu')
-        else:
-            label_ = self.torch_user_adj.to_dense().flatten().to('cpu')
-        predict_ = torch.sigmoid(self.reconstructions.detach().flatten().to('cpu'))
-        scores_dict['auc'] = roc_auc_score(label_, predict_)
+        label_ = self.origin_adj.to_dense().flatten().to('cpu')
+        predict_ = torch.sigmoid(self.reconstruct.detach().flatten().to('cpu'))
+        scores_dict['f1-score'] = f1_score(label_, predict_ >= 0.5)
+        scores_dict['auc'] = 0
         scores_dict['ap'] = 0
         scores_dict['confusion_matrix'] = np.array([[0, 0], [0, 0]])
+        # scores_dict['auc'] = roc_auc_score(label_, predict_)
         # scores_dict['ap'] = average_precision_score(label_, predict_)
         # scores_dict['confusion_matrix'] = confusion_matrix(label_, predict_ > 0.5)
         return scores_dict
@@ -131,63 +102,86 @@ class ModCDModel(nn.Module):
     def parameters(self, recurse: bool = True):
         return self.cd_encoder_decoder.parameters()
 
+    def match_community_pair(self, k_partition: dict):
+        """
+        @param k_partition: the result of community detection
+        @return: the matched communities {comm_id1: comm_id2,}
+        """
+        index_id_map = {index: comm_id for index, comm_id in enumerate(set(k_partition.values()))}
+        id_index_map = {comm_id: index for index, comm_id in enumerate(set(k_partition.values()))}
+        comm_num = len(index_id_map)
+        comm_rep = torch.zeros(comm_num, self.node_emb.size(1)).to(self.device)
+        node_num = torch.zeros(comm_num).to(self.device)
+        for node, comm_id in k_partition.items():
+            comm_rep[id_index_map[comm_id]] += self.node_emb[node]
+            node_num[id_index_map[comm_id]] += 1
+        comm_rep = comm_rep/node_num.reshape(-1, 1)
+        comm_rep = func.normalize(comm_rep, p=2, dim=1)
+        similarity_matrix = torch.mm(comm_rep, comm_rep.t())
+        similarity_matrix.fill_diagonal_(-torch.inf)
+        match_pair = {}
+        paired_comm = []
+        for i in range(comm_num):   # 删除重复的社区对
+            if i not in paired_comm:
+                matched_comm = torch.argmax(similarity_matrix[i, :]).item()
+                match_pair[index_id_map[i]] = index_id_map[matched_comm]
+                paired_comm.append(i)
+                paired_comm.append(matched_comm)
+        return match_pair
+
 
 class CDEncoderDecoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, metadata, basic_model="HGT"):
+    def __init__(self, hidden_dim, output_dim, args):
         super(CDEncoderDecoder, self).__init__()
-        self.model = basic_model
-        self.metadata = (['user'], [edge_type for edge_type in metadata[1] if edge_type[0] == edge_type[2]])
-        self.linear = nn.Linear(input_dim, hidden_dim)
-        # self.HGT = HGTConv(in_channels={'user': hidden_dim}, out_channels=hidden_dim, metadata=metadata)
-        self.Hetero_Conv = self.choice_basic_model(in_channels={'user': hidden_dim}, out_channels=hidden_dim,
-                                                   metadata=metadata)
+        self.num_prop_size = args.num_prop_size
+        self.cat_prop_size = args.cat_prop_size
+        self.des_size = args.des_size
+        self.tweet_size = args.tweet_size
+        self.linear_relu_des = nn.Sequential(nn.Linear(args.des_size, int(args.embedding_dim / 4)),
+                                             nn.LeakyReLU(), nn.Dropout(args.dropout))
+        self.linear_relu_tweet = nn.Sequential(nn.Linear(args.tweet_size, int(args.embedding_dim / 4)),
+                                               nn.LeakyReLU(), nn.Dropout(args.dropout))
+        self.linear_relu_num_prop = nn.Sequential(nn.Linear(args.num_prop_size, int(args.embedding_dim / 4)),
+                                                  nn.LeakyReLU(), nn.Dropout(args.dropout))
+        self.linear_relu_cat_prop = nn.Sequential(nn.Linear(args.cat_prop_size, int(args.embedding_dim / 4)),
+                                                  nn.LeakyReLU(), nn.Dropout(args.dropout))
+
         self.weight_layer1 = torch.nn.Parameter(init_weight(hidden_dim, hidden_dim))
         self.weight_layer2 = torch.nn.Parameter(init_weight(hidden_dim, output_dim))
-        nn.init.xavier_uniform_(self.weight_layer1)
-        nn.init.xavier_uniform_(self.weight_layer2)
 
         self.init_weight()
 
-    def choice_basic_model(self, in_channels, out_channels, metadata):
-        if self.model == "HGT":
-            # return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=2)
-            return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=1)
-        elif self.model == "GAT":
-            return HeteroConv({edge_type: GATConv((-1, -1), out_channels) for edge_type in metadata[1]
-                               if edge_type[0] == edge_type[2]}, aggr='sum')
-        elif self.model == "SAGE":
-            return HeteroConv({edge_type: SAGEConv((-1, -1), out_channels) for edge_type in metadata[1]
-                               if edge_type[0] == edge_type[2]}, aggr='sum')
-
-    def update_conv_layer(self, param):
-        self.Hetero_Conv.load_state_dict(param, strict=False)
+    def update_embedding_layer(self, param):
+        self.load_state_dict(param, strict=False)
 
     def init_weight(self):
+        nn.init.xavier_uniform_(self.weight_layer1)
+        nn.init.xavier_uniform_(self.weight_layer2)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 torch.nn.init.kaiming_uniform_(module.weight.data)
 
-    def forward(self, user_feature, s_normalized_adj, o_normalized_adj, gamma, fast_gae=False, sample_user=None):
-        user_feature = self.linear(user_feature)
-        x_dict = {'user': user_feature}
-        edge_dict = {edge_type: o_normalized_adj.indices() for edge_type in self.metadata[1]}
-        user_feature = self.Hetero_Conv(x_dict, edge_dict)['user']
+    def forward(self, user_feature, adj, gamma):
+        num_prop = user_feature[:, :self.num_prop_size]
+        cat_prop = user_feature[:, self.num_prop_size:(self.num_prop_size + self.cat_prop_size)]
+        des = user_feature[:, (self.num_prop_size + self.cat_prop_size):
+                              (self.num_prop_size + self.cat_prop_size + self.des_size)]
+        tweet = user_feature[:, (self.num_prop_size + self.cat_prop_size + self.des_size):]
+        user_features_des = self.linear_relu_des(des)
+        user_features_tweet = self.linear_relu_tweet(tweet)
+        user_features_numeric = self.linear_relu_num_prop(num_prop)
+        user_features_bool = self.linear_relu_cat_prop(cat_prop)
+        user_feature = torch.cat((user_features_numeric, user_features_bool,
+                                  user_features_des, user_features_tweet), dim=1)
+
         # graph encoder
-        z_hidden = torch.sparse.mm(s_normalized_adj, torch.mm(user_feature, self.weight_layer1))
-        z_mean = torch.sparse.mm(o_normalized_adj, torch.mm(z_hidden, self.weight_layer2))
+        z_hidden = torch.sparse.mm(adj, torch.mm(user_feature, self.weight_layer1))
+        z_mean = torch.sparse.mm(adj, torch.mm(z_hidden, self.weight_layer2))
 
-        if fast_gae:
-            sample_z_mean = z_mean[sample_user, :]
-            # graph decoder
-            reconstructions = torch.matmul(sample_z_mean, sample_z_mean.t())
-            # modularity inspired decoder
-            clusters_distance = pairwise_distance(sample_z_mean, gamma)
-
-        else:
-            # graph decoder
-            reconstructions = torch.matmul(z_mean, z_mean.t())
-            # modularity inspired decoder
-            clusters_distance = pairwise_distance(z_mean, gamma)
+        # graph decoder
+        reconstructions = torch.matmul(z_mean, z_mean.t())
+        # modularity inspired decoder
+        clusters_distance = pairwise_distance(z_mean, gamma)
 
         return reconstructions, clusters_distance, z_mean
 
@@ -207,13 +201,11 @@ def cd_loss(predicts, labels, degree_matrix, clusters_distance, pos_weights, bet
     labels = torch.flatten(labels.to_dense())
     degree_matrix = torch.flatten(degree_matrix.to_dense())
     clusters_distance = torch.flatten(clusters_distance)
-    # 重构损失
-    reconstruct_loss = func.binary_cross_entropy_with_logits(predicts.flatten(),
-                                                             labels,
-                                                             pos_weight=pos_weights)
+    # reconstruction loss
+    reconstruct_loss = func.binary_cross_entropy_with_logits(predicts.flatten(), labels, pos_weight=pos_weights)
     # conf_matrix = confusion_matrix(labels.to('cpu'), torch.sigmoid(predicts.flatten().detach().to('cpu')) > 0.5)
     # print(conf_matrix)
-    # 模块度损失
+    # modularity loss
     modularity_loss = (1.0 / node_num) * torch.sum((labels - degree_matrix) * clusters_distance)
 
     all_loss = reconstruct_loss - beta * modularity_loss

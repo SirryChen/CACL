@@ -2,15 +2,16 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
-from torch.nn.functional import normalize
 from torch_geometric.nn.conv import HeteroConv, HGTConv, RGCNConv, FastRGCNConv, GATConv, SAGEConv
 from torch_geometric.nn.norm import BatchNorm
 import numpy as np
 from sklearn.metrics import confusion_matrix
 from torch_geometric.data import HeteroData
-from torch.nn.functional import cosine_similarity, cross_entropy
+from torch.nn.functional import cross_entropy
 from copy import deepcopy
 from utils import drop_feature, feature_drop_weights, compute_page_rank, add_self_loop, tweet_augment
+from CL_utils import compute_hard_loss, compute_pro_loss, unsupervised_cl_loss, traditional_cl_loss, \
+    compute_cross_mean_view_loss, compute_cross_individual_loss
 
 
 class MLPProjector(nn.Module):
@@ -108,7 +109,8 @@ class HeteroGraphConvModel(nn.Module):
             # return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=2)
             return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=1)
         elif self.model == "GAT":
-            return HeteroConv({edge_type: GATConv((-1, -1), out_channels) for edge_type in metadata[1]}, aggr='sum')
+            return HeteroConv({edge_type: GATConv((-1, -1), out_channels, add_self_loops=False)
+                               for edge_type in metadata[1]}, aggr='sum')
         elif self.model == "SAGE":
             return HeteroConv({edge_type: SAGEConv((-1, -1), out_channels) for edge_type in metadata[1]}, aggr='sum')
 
@@ -125,7 +127,7 @@ class HeteroGraphConvModel(nn.Module):
                         layer.bias.data.fill_(0.0)
 
     def init_first_layer(self, weight):
-        self.Hetero_Conv_list[0].load_state_dict(weight, strict=False)
+        self.load_state_dict(weight, strict=False)
 
 
 # 创建HGcnCLModel模型
@@ -146,7 +148,7 @@ class HGcnCLModel(nn.Module):
             return node_projections, None
 
     def update_cd_model(self):
-        return self.encoder.Hetero_Conv_list[0].state_dict()
+        return self.encoder.state_dict()
 
 
 class Classifier(nn.Module):
@@ -226,11 +228,19 @@ class SubGraphDataset:
         self.graph = dataloader.data
         self.cd_model = cd_model
         self.dataloader = dataloader
+        self.init_cd_model()
 
     def __len__(self):
         return len(self.dataloader)
 
+    def init_cd_model(self):
+        if self.cd_model is not None:
+            for graph in self.dataloader:
+                self.cd_model(graph)
+                break
+
     def subgraph(self, tqdm_bar):
+        # generate one subgraph for one loop
         for graph in self.dataloader:
             graph['user'].batch_mask = torch.tensor([True] * graph['user'].batch_size +
                                                     [False] * (graph['user'].x.size(0) - graph['user'].batch_size))
@@ -239,9 +249,22 @@ class SubGraphDataset:
                 tqdm_bar.update(1)
             else:
                 new_edge_index, k_partition = self.cd_model(graph)
-                for subgraph in generate_subgraph(graph, k_partition, new_edge_index):
-                    yield subgraph
+                for comm_id in set(k_partition.values()):
+                    yield generate_subgraph(graph, comm_id, k_partition, new_edge_index)
                 tqdm_bar.update(1)
+
+    def subgraph_matched(self, tqdm_bar):
+        # generate matched subgraph_1 and subgraph_2 for one loop
+        for graph in self.dataloader:
+            graph['user'].batch_mask = torch.tensor([True] * graph['user'].batch_size +
+                                                    [False] * (graph['user'].x.size(0) - graph['user'].batch_size))
+            new_edge_index, k_partition = self.cd_model(graph)
+            match_pair = self.cd_model.match_community_pair(k_partition)
+            for comm_1, comm_2 in match_pair.items():
+                subgraph_1 = generate_subgraph(graph, comm_1, k_partition, new_edge_index)
+                subgraph_2 = generate_subgraph(graph, comm_2, k_partition, new_edge_index)
+                yield subgraph_1, subgraph_2
+            tqdm_bar.update(1)
 
     def get_loss_weight(self):
         node_label = torch.tensor(self.graph['user'].node_label)
@@ -262,120 +285,45 @@ class SubGraphDataset:
         return in_channel
 
 
-def compute_cl_loss(emb1, emb2, label: torch.tensor, split: torch.tensor, tau):
-    def trans(x, t=tau):
-        return torch.exp(x / t)
-
-    def cos_loss(node_emb, node_emb_opposite, node_emb_diff_label):
-        self_loss = trans(cosine_similarity(node_emb.unsqueeze(0), node_emb_opposite.unsqueeze(0)).squeeze(0))
-        if len(node_emb_diff_label) != 0:
-            between_loss = torch.sum(trans(torch.matmul(node_emb, node_emb_diff_label.t())
-                                           / (torch.norm(node_emb) * torch.norm(node_emb_diff_label, dim=1))))
-        else:
-            between_loss = torch.tensor(1e-5)
-        loss_ = self_loss / (self_loss + between_loss)
-        return loss_
-
-    label[split != 0] = 2           # 分离训练集
-    bot_emb1 = emb1[label == 1]
-    human_emb1 = emb1[label == 0]
-    bot_emb2 = emb2[label == 1]
-    human_emb2 = emb2[label == 0]
-    total_loss = []
-    for node in range(label.size(0)):
-        node1_emb = emb1[node]
-        node2_emb = emb2[node]
-        if label[node] == 1:
-            loss1 = cos_loss(node1_emb, emb2[node], human_emb2)
-            loss2 = cos_loss(node2_emb, emb1[node], human_emb1)
-            loss = (loss1 + loss2) / 2
-        elif label[node] == 0:
-            loss1 = cos_loss(node1_emb, emb2[node], bot_emb2)
-            loss2 = cos_loss(node2_emb, emb1[node], bot_emb1)
-            loss = (loss1 + loss2) / 2
-        else:
-            loss1 = cos_loss(node1_emb, emb2[node], torch.cat((emb2[:node], emb2[node+1:]), dim=0))
-            loss2 = cos_loss(node2_emb, emb1[node], torch.cat((emb1[:node], emb1[node+1:]), dim=0))
-            loss = (loss1 + loss2) / 2
-        total_loss.append(- torch.log(loss))
-    average_loss = sum(total_loss) / len(total_loss)
-
-    return average_loss
-
-
-def traditional_cl_loss(emb1, emb2, label, split, tau):
-    emb1 = normalize(emb1)
-    emb2 = normalize(emb2)
-    all_sim = torch.exp(torch.matmul(emb1, emb2.t()) / tau)
-    label[split != 0] = 2  # 分离训练集
-    bot_emb1 = emb1[label == 1]
-    human_emb1 = emb1[label == 0]
-    bot_emb2 = emb2[label == 1]
-    human_emb2 = emb2[label == 0]
-    total_loss = []
-    for node in range(label.size(0)):
-        if label[node] == 0:
-            loss1 = torch.sum(- torch.log(
-                torch.exp(torch.matmul(emb1[node], bot_emb2.t()) / tau) / torch.sum(all_sim[node]))
-                              ) / bot_emb2.size(0)
-            loss2 = torch.sum(- torch.log(
-                torch.exp(torch.matmul(emb2[node], bot_emb1.t()) / tau) / torch.sum(all_sim[node]))
-                              ) / bot_emb1.size(0)
-        elif label[node] == 1:
-            loss1 = torch.sum(- torch.log(
-                torch.exp(torch.matmul(emb1[node], human_emb2.t()) / tau) / torch.sum(all_sim[node]))
-                              ) / human_emb2.size(0)
-            loss2 = torch.sum(- torch.log(
-                torch.exp(torch.matmul(emb2[node], human_emb1.t()) / tau) / torch.sum(all_sim[node]))
-                              ) / human_emb1.size(0)
-        else:
-            continue
-        loss = (loss1 + loss2) / 2
-        if torch.isinf(loss):
-            pass
-        total_loss.append(loss)
-    average_loss = sum(total_loss) / len(total_loss)
-
-    return average_loss
-
-
-def unsupervised_cl_loss(emb1, emb2, split, tau):
-    def sim(z1: torch.Tensor, z2: torch.Tensor):
-        z1 = normalize(z1)
-        z2 = normalize(z2)
-        return torch.mm(z1, z2.t())
-
-    def semi_loss(z1: torch.Tensor, z2: torch.Tensor):
-        refl_sim = torch.exp(sim(z1, z1) / tau)      # intra-view
-        between_sim = torch.exp(sim(z1, z2) / tau)   # inter-view
-
-        return -torch.log(between_sim.diag() / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
-
-    emb1 = emb1[split == 0]
-    emb2 = emb2[split == 0]
-    loss1 = semi_loss(emb1, emb2)
-    loss2 = semi_loss(emb2, emb1)
-    total_loss = ((loss1 + loss2) * 0.5).mean()
-    return total_loss
-
-
-def compute_loss(emb1, emb2, pred, label: torch.tensor, split: torch.tensor, tau, alpha=0.01, beta=1):
-    cl_loss = compute_cl_loss(emb1, emb2, label, split, tau)      # 改进的对比损失函数
-    # cl_loss = unsupervised_cl_loss(emb1, emb2, split, tau)          # 无监督的对比损失函数
-    # cl_loss = traditional_cl_loss(emb1, emb2, label, split, tau)  # 传统的有监督对比损失函数
+def compute_loss(emb1, emb2, pred, label, split, tau, alpha=0.01, beta=1):
+    # cl_loss = compute_pro_loss(emb1, emb2, label, split, tau)                                    # 改进的对比损失函数
+    # cl_loss = compute_hard_loss(emb1, emb2, label, split, positive_bot, positive_human, tau)  # 同时考虑正负难样本
+    cl_loss = unsupervised_cl_loss(emb1, emb2, split, tau)                                    # 无监督的对比损失函数
+    # cl_loss = traditional_cl_loss(emb1, emb2, label, split, tau)                              # 传统的有监督对比损失函数
     if pred is not None:
         train_mask = split == 0
         # bot_num = torch.sum(label[train_mask] == 1)
         # human_num = torch.sum(label[train_mask] == 0)
         # weight = torch.tensor([bot_num/(bot_num+human_num), human_num/(bot_num+human_num)]).to(pred.device)
-        # weight = torch.tensor([5, 3], dtype=torch.float).to(pred.device)
-        pred_loss = cross_entropy(pred[train_mask], label[train_mask], weight=None)
+        # weight = torch.tensor([2, 5], dtype=torch.float).to(pred.device)
+        pred_loss = cross_entropy(pred[train_mask], label[train_mask])
         loss = alpha * cl_loss + beta * pred_loss
-        conf_matrix = confusion_matrix(label[train_mask].to('cpu'), torch.argmax(pred[train_mask].to('cpu'), dim=1))
-        print(conf_matrix)
+        # conf_matrix = confusion_matrix(label[train_mask].to('cpu'), torch.argmax(pred[train_mask].to('cpu'), dim=1))
+        # print(conf_matrix)
         return loss
     else:
         return cl_loss
+
+
+def compute_cross_view_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, pred_b,
+                            label_a, label_b, tau, alpha, beta, mean_flag=True):
+    if mean_flag:
+        contrastive_loss_a = compute_cross_mean_view_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2,
+                                                          pred_a, label_a, label_b, tau)
+        contrastive_loss_b = compute_cross_mean_view_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
+                                                          pred_b, label_b, label_a, tau)
+    else:
+        contrastive_loss_a = compute_cross_individual_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2,
+                                                           pred_a, label_a, label_b, tau)
+        contrastive_loss_b = compute_cross_individual_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
+                                                           pred_b, label_b, label_a, tau)
+
+    contrastive_loss = (contrastive_loss_a + contrastive_loss_b) / 2
+    prediction_loss = cross_entropy(pred_a, label_a)
+
+    total_loss = alpha * contrastive_loss + beta * prediction_loss
+
+    return total_loss
 
 
 # 计算节点的PageRank centrality并执行自适应增强
@@ -429,10 +377,11 @@ def total_tweet_augment(graph_path, augment_method=None, tweet_dim=32):
     return new_graph
 
 
-def generate_subgraph(graph: HeteroData, partition: dict, new_user_edge_index=None):
+def generate_subgraph(graph: HeteroData, comm_id, partition: dict, new_user_edge_index=None):
     """
     根据社区分类进行分割子图
     @param graph: 原图
+    @param comm_id: 社区编号
     @param partition: 社区检测结果{node_id: comm_id}
     @param new_user_edge_index: 增强的用户之间的边
     @return: 子图
@@ -450,40 +399,36 @@ def generate_subgraph(graph: HeteroData, partition: dict, new_user_edge_index=No
                     node_num[edge_type[2]] += 1
                 sub_edge_index[1].append(node_mask[edge_type[2]][target])
 
-    community_ids = set(partition.values())
     node_types = graph.node_types
     edge_types = graph.edge_types
 
-    for comm_id in community_ids:
-        node_mask = {node_type: [None] * graph[node_type].x.size(-2) if node_type != 'tweet' else
-                     [None] * graph[node_type].x1.size(-2) for node_type in node_types}
-        node_num = {node_type: 0 for node_type in node_types}
-        subgraph = HeteroData()
-        for edge_type in edge_types:
-            sub_edge_index = [[], []]
-            generate_edge_index(graph[edge_type].edge_index.t().numpy())
-            subgraph[edge_type].edge_index = torch.tensor(sub_edge_index, dtype=torch.long)
-            if edge_type[0] == edge_type[2] and new_user_edge_index is not None:
-                generate_edge_index(new_user_edge_index.t().numpy())
-                subgraph[edge_type].augmented_edge_index = torch.tensor(sub_edge_index, dtype=torch.long)
-                subgraph[edge_type].augmented_edge_index = add_self_loop(subgraph[edge_type].augmented_edge_index,
-                                                                         node_num[edge_type[0]])
-
-        for node_type in node_types:
-            trans = [[ind, mask] for ind, mask in enumerate(node_mask[node_type]) if mask is not None]
-            sample_ind = [0] * len(trans)
-            for tran in trans:
-                sample_ind[tran[1]] = tran[0]
-            if node_type == 'tweet':
-                subgraph[node_type].x1 = graph[node_type].x1[sample_ind]
-                subgraph[node_type].x2 = graph[node_type].x2[sample_ind]
-            else:
-                subgraph[node_type].x = graph[node_type].x[sample_ind]
-            if node_type == 'user':
-                subgraph[node_type].batch_mask = graph[node_type].batch_mask[sample_ind]
-            if hasattr(graph[node_type], 'node_label'):
-                subgraph[node_type].node_label = graph[node_type].node_label[sample_ind]
-            if hasattr(graph[node_type], 'node_split'):
-                subgraph[node_type].node_split = graph[node_type].node_split[sample_ind]
-
-        yield subgraph
+    node_mask = {node_type: [None] * graph[node_type].x.size(-2) if node_type != 'tweet' else
+                 [None] * graph[node_type].x1.size(-2) for node_type in node_types}
+    node_num = {node_type: 0 for node_type in node_types}
+    subgraph = HeteroData()
+    for edge_type in edge_types:
+        sub_edge_index = [[], []]
+        generate_edge_index(graph[edge_type].edge_index.t().numpy())
+        subgraph[edge_type].edge_index = torch.tensor(sub_edge_index, dtype=torch.long)
+        if edge_type[0] == edge_type[2] and new_user_edge_index is not None:
+            generate_edge_index(new_user_edge_index.t().numpy())
+            subgraph[edge_type].augmented_edge_index = torch.tensor(sub_edge_index, dtype=torch.long)
+            subgraph[edge_type].augmented_edge_index = add_self_loop(subgraph[edge_type].augmented_edge_index,
+                                                                     node_num[edge_type[0]])
+    for node_type in node_types:
+        trans = [[ind, mask] for ind, mask in enumerate(node_mask[node_type]) if mask is not None]
+        sample_ind = [0] * len(trans)
+        for tran in trans:
+            sample_ind[tran[1]] = tran[0]
+        if node_type == 'tweet':
+            subgraph[node_type].x1 = graph[node_type].x1[sample_ind]
+            subgraph[node_type].x2 = graph[node_type].x2[sample_ind]
+        else:
+            subgraph[node_type].x = graph[node_type].x[sample_ind]
+        if node_type == 'user':
+            subgraph[node_type].batch_mask = graph[node_type].batch_mask[sample_ind]
+        if hasattr(graph[node_type], 'node_label'):
+            subgraph[node_type].node_label = graph[node_type].node_label[sample_ind]
+        if hasattr(graph[node_type], 'node_split'):
+            subgraph[node_type].node_split = graph[node_type].node_split[sample_ind]
+    return subgraph

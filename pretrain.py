@@ -2,7 +2,7 @@ import os
 import json
 import torch
 from CD_model import ModCDModel
-from torch_geometric.loader import HGTLoader, NeighborLoader
+from torch_geometric.loader import NeighborLoader
 from torch_geometric.data import HeteroData
 from tqdm import tqdm
 from utils import super_parament_initial
@@ -11,7 +11,7 @@ from utils import super_parament_initial
 def train(step):
     CDModel.train()
     loss_ = 0.0
-    train_score_ = {'auc': [], 'ap': []}
+    train_score_ = {'auc': [], 'ap': [], 'f1-score': []}
     tqdm_bar = tqdm(total=len(dataloader), ncols=150)
     tqdm_bar.set_description(f'train: {step}/{epoch_num}')
     for subgraph in iter(dataloader):
@@ -24,18 +24,21 @@ def train(step):
 
         loss_ += cd_loss.item()
         score_ = CDModel.compute_score()
+        train_score_['f1-score'].append(score_['f1-score'])
         train_score_['auc'].append(score_['auc'])
         train_score_['ap'].append(score_['ap'])
         tqdm_bar.set_postfix_str(f"loss: {round(cd_loss.item(), 3)}, "
-                                 f"auc: {round(score_['auc'], 3)}, "
-                                 f"ap: {round(score_['ap'], 3)}, "
+                                 f"f1-score: {round(score_['f1-score'], 3)}"
+                                 f"auc: {round(score_['auc'], 2)}, "
+                                 f"ap: {round(score_['ap'], 2)}, "
                                  f"mat: {score_['confusion_matrix'][0].tolist()}"
                                  f"{score_['confusion_matrix'][1].tolist()}")
         tqdm_bar.update(1)
-
+    train_score_['f1-score'] = sum(train_score_['f1-score']/len(train_score_['f1-score']))
     train_score_['auc'] = sum(train_score_['auc'])/len(train_score_['auc'])
     train_score_['ap'] = sum(train_score_['ap'])/len(train_score_['ap'])
     tqdm_bar.set_postfix_str(f"loss: {round(loss_ / len(dataloader), 3)}, "
+                             f"f1-score: {round(train_score_['f1-score'], 3)}, "
                              f"auc: {round(train_score_['auc'], 3)}, "
                              f"ap: {round(train_score_['ap'], 3)}")
 
@@ -44,19 +47,20 @@ def train(step):
 
 def val():
     CDModel.eval()
-    val_score_ = {'auc': [], 'ap': []}
+    val_score_ = {'auc': [], 'ap': [], 'f1-score': []}
     with torch.no_grad():
         for subgraph in iter(dataloader):
             CDModel(subgraph)
 
             score_ = CDModel.compute_score()
+            val_score_['f1-score'].append(score_['f1-score'])
             val_score_['auc'].append(score_['auc'])
             val_score_['ap'].append(score_['ap'])
             break
-
+    val_score_['f1-score'] = sum(val_score_['f1-score'])/len(val_score_['f1-score'])
     val_score_['auc'] = sum(val_score_['auc'])/len(val_score_['auc'])
     val_score_['ap'] = sum(val_score_['ap'])/len(val_score_['ap'])
-    print(f"val: auc-{val_score_['auc']}, ap-{val_score_['ap']}")
+    print(f"val: f1-score-{val_score_['f1-score']}, auc-{val_score_['auc']}, ap-{val_score_['ap']}")
     return val_score_
 
 
@@ -66,7 +70,7 @@ if __name__ == "__main__":
     args = s_parament.parse_args()
 
     dataset_name = args.dataset
-    device_cd = torch.device("cuda:2") if torch.cuda.is_available() else torch.device('cpu')
+    device_cd = torch.device("cuda:1") if torch.cuda.is_available() else torch.device('cpu')
 
     predata_file_path = f"./predata/{dataset_name}/"
     model_save_path = f"./train_result/{dataset_name}/"
@@ -82,13 +86,12 @@ if __name__ == "__main__":
     for edge_type in graph.edge_types:
         if edge_type[0] != edge_type[2]:
             graph[edge_type[2], edge_type[1], edge_type[0]].edge_index = graph[edge_type].edge_index[[1, 0]]
-    # graph['tweet', 'from', 'user'].edge_index = graph['user', 'post', 'tweet'].edge_index[[1, 0]]
 
     num_neighbors = {edge_type: [50] * 3 if edge_type[0] != 'tweet' else [0] * 3 for edge_type in graph.edge_types}
-    kwargs = {'batch_size': 4000, 'num_workers': 6, 'persistent_workers': True}
+    kwargs = {'batch_size': 2000, 'num_workers': 6, 'persistent_workers': True}
     dataloader = NeighborLoader(graph, num_neighbors=num_neighbors, shuffle=True, input_nodes='user', **kwargs)
 
-    CDModel = ModCDModel(graph['user'].x.size(-1), args, cd_config, device_cd, graph.metadata(), pretrain=True)
+    CDModel = ModCDModel(args, cd_config, device_cd, pretrain=True)
     CDModel = CDModel.to(device_cd)
     optimizer_CD = torch.optim.Adam(params=CDModel.parameters(), lr=cd_config['lr'])
 
@@ -96,8 +99,8 @@ if __name__ == "__main__":
     max_error_time = cd_config['max_error_times']
     record_score = {'train': [], 'val': []}
     record_loss = {}
-    best_auc = 0.0
-    best_ap = 0.0
+    best_target = 0
+    target_name = 'f1-score'
     error_time = 0
     for epoch in range(epoch_num):
         train_loss, train_score = train(epoch)
@@ -107,8 +110,8 @@ if __name__ == "__main__":
         record_loss[epoch] = train_loss
         record_score['val'].append(val_score)
 
-        if val_score['auc'] >= best_auc:
-            best_auc = val_score['auc']
+        if val_score[target_name] >= best_target:
+            best_target = val_score[target_name]
             torch.save(CDModel.cd_encoder_decoder.state_dict(),
                        model_save_path + f'pretrain_cd_model_{args.basic_model}.pth')
             error_time = 0

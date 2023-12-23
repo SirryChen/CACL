@@ -7,6 +7,7 @@ import numpy as np
 import ijson
 from tqdm import tqdm
 from utils import calc_activate_days
+from transformers import AutoTokenizer, AutoModel
 from gensim.models.doc2vec import Doc2Vec
 import nltk
 nltk.data.path.append(r'/data1/botdet/LLM/nltk/nltk_data-gh-pages/packages')
@@ -35,58 +36,75 @@ def wordnet_paraphrase(text):
     return augmented_text
 
 
+def collect_file():
+    if os.path.exists(dataset_file_path + 'node_info.json'):
+        return
+    twibot20_no_graph_dataset_path = "/data1/botdet/datasets/Twibot-20-new/"
+    node_info = []
+    for node_type in ['train', 'dev', 'support', 'test']:
+        with open(twibot20_no_graph_dataset_path + f'{node_type}.json', 'r') as fp:
+            node = json.load(fp)
+            node_info.extend(node)
+    with open(dataset_file_path + 'node_info.json', 'w') as fp:
+        json.dump(node_info, fp)
+
+
 def get_users_feature():
     """
     提取用户的特征，数字特征+文本特征（描述+名字）
     @return: 用户特征字典{user_id: user_feature}
     """
-    # if os.path.exists(predata_file_path + 'users_feature.json'):
-    #     with open(predata_file_path + 'users_feature.json', 'r') as fp:
-    #         users_feature_dict = json.load(fp)
-    #         return users_feature_dict
+    if os.path.exists(predata_file_path + 'users_feature.json'):
+        with open(predata_file_path + 'users_feature.json', 'r') as fp:
+            users_feature_dict = json.load(fp)
+            return users_feature_dict
+    tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
+    encoder = AutoModel.from_pretrained(bert_model_path)
 
-    model = Doc2Vec.load(doc2vec_model_path + "pretrained_wiki_doc2vec_128.model")
-    properties_list = ['created_at',
-                       {'public_metrics': ['followers_count', 'following_count', 'tweet_count', 'listed_count']},
-                       'description', 'entities', 'location',
-                       'pinned_tweet_id', 'profile_image_url', 'protected',
-                       'url', 'username', 'verified', 'withheld']
-    properties_number = 15
+    num_properties_list = ["followers_count", "friends_count", "listed_count", "created_at",
+                           "favourites_count", "statuses_count"]
 
-    with open(dataset_file_path + 'node.json', 'r') as file:
+    bool_properties_list = ['protected', 'geo_enabled', 'verified', 'contributors_enabled', 'is_translator',
+                            'is_translation_enabled', 'profile_background_tile', 'profile_use_background_image',
+                            'has_extended_profile', 'default_profile', 'default_profile_image']
+    text_properties_list = ['name', 'description']
+    properties_number = len(num_properties_list) + len(bool_properties_list)
+
+    with open(dataset_file_path + 'node_info.json', 'r') as file:
         users = ijson.items(file, 'item')
         users_feature_dict = {}
-        for user in tqdm(users, desc='加载用户特征'):
-            if user['id'].find('u') == -1:
+        for user_info in tqdm(users, desc='加载用户特征'):
+            if user_info.get('profile') is None:
                 continue
-            users_feature_dict[user['id']] = []
-            num_feature = []
-            text_str = ''
-            for user_property in properties_list:
-                if isinstance(user_property, dict):
-                    for count_property in user_property["public_metrics"]:
-                        if user["public_metrics"][count_property] is None:
-                            num_feature.append(0)
-                        else:
-                            num_feature.append(user["public_metrics"][count_property])
-                elif user[user_property] is None:  # 属性为空则补0
-                    if user_property not in ['username', 'description']:
-                        num_feature.append(0)
-                elif user_property in ['withheld', 'url', 'profile_image_url',  # bool属性值，非None就输入1
-                                       'pinned_tweet_id', 'entities', 'location']:
-                    num_feature.append(1)
-                elif user_property in ['verified', 'protected']:
-                    num_feature.append(int(user[user_property] == 'True'))
-                elif user_property in ['username', 'description']:
-                    text_str += user[user_property]
-                elif user_property in ['created_at']:
-                    num_feature.append(calc_activate_days(user[user_property].strip()))
-            text_feature = [float(i) for i in model.infer_vector(text_str.split())]
-            users_feature_dict[user['id']] = num_feature + text_feature
+            user = user_info['profile']
+            each_user_feature = []
+            for user_property in num_properties_list:
+                if user.get(user_property) is None:
+                    each_user_feature.append(0)
+                else:
+                    if user_property == 'created_at':
+                        each_user_feature.append(calc_activate_days(user[user_property]))
+                    else:
+                        each_user_feature.append(int(user[user_property]))
+            for user_property in bool_properties_list:
+                if user.get(user_property) is None or user[user_property] != "True ":
+                    each_user_feature.append(0)
+                else:
+                    each_user_feature.append(1)
+            user_text = []
+            for user_property in text_properties_list:
+                user_text.append(user.get(user_property))
+
+            user_text = f'{user_text[0]}: {user_text[1]}'
+            encode_text = encoder(**tokenizer(user_text, return_tensors='pt')).last_hidden_state[:, 0, :][0].tolist()
+            each_user_feature.extend(encode_text)
+            users_feature_dict[f"u{user['id']}".strip()] = each_user_feature
+
             # 属性值数目小于规定值时报错
-            assert len(users_feature_dict[user['id']]) == properties_number + len(text_feature) - 2, \
-                'user:{}, properties_number:{} < {}'.format(user['id'], len(users_feature_dict[user['id']]),
-                                                            properties_number + len(text_feature) - 2)
+            assert len(users_feature_dict[f"u{user['id']}".strip()]) == properties_number + 768, \
+                'user:{}, properties_number:{} < {}'.format(user['id'],
+                                                            len(users_feature_dict[f"u{user['id']}".strip()]),
+                                                            properties_number + 768)
     with open(predata_file_path + 'users_feature.json', 'w') as fp:
         json.dump(users_feature_dict, fp)
 
@@ -94,7 +112,7 @@ def get_users_feature():
     properties = [users_feature_dict[user_id] for user_id in users_id]
 
     properties = np.array(properties)
-    for column in tqdm(range(properties_number - 2), desc='用户特征z-score归一化', ncols=50):
+    for column in tqdm(range(properties_number), desc='用户特征z-score归一化', ncols=50):
         mean = np.mean(properties[:, column])  # 求平均值
         std = np.std(properties[:, column])  # 求标准差
         if std == 0:
@@ -112,7 +130,7 @@ def get_users_feature():
 
 def get_tweets_feature():
     """
-    寻找并保存其包含的tweet节点的文本
+    寻找并保存tweet节点的文本
     """
     if os.path.exists(predata_file_path + 'tweets_text.json'):
         with open(predata_file_path + 'tweets_text.json', 'r') as fp:
@@ -158,6 +176,8 @@ def get_node_label_split(load_from_local=False):
 
 
 def pytorch_edge_build(user_labels_dict, user_splits_dict, users_feature_dict, tweets_text_dict):
+    if os.path.exists(predata_file_path + 'cache/pre_graph.pt'):
+        return
     torch_graph = HeteroData()
     user_id_index_map = {}
     tweet_id_index_map = {}
@@ -177,24 +197,25 @@ def pytorch_edge_build(user_labels_dict, user_splits_dict, users_feature_dict, t
             if relation in ['follow', 'friend']:
                 if edge_index_dict.get(('user', relation, 'user')) is None:
                     edge_index_dict['user', relation, 'user'] = []
-                if user_id_index_map.get(source) is None:
+                if user_id_index_map.get(source) is None and users_feature_dict.get(source) is not None:
                     user_id_index_map[source] = max_user_index
                     max_user_index += 1
                     user_features.append(users_feature_dict[source])
                     user_label.append(user_labels_dict.get(source))
                     user_split.append(graph_types_map[user_splits_dict.get(source)])
-                if user_id_index_map.get(target) is None:
+                if user_id_index_map.get(target) is None and users_feature_dict.get(target) is not None:
                     user_id_index_map[target] = max_user_index
                     max_user_index += 1
                     user_features.append(users_feature_dict[target])
                     user_label.append(user_labels_dict.get(target))
                     user_split.append(graph_types_map[user_splits_dict.get(target)])
-                edge_index_dict['user', relation, 'user'].append([user_id_index_map[source],
-                                                                  user_id_index_map[target]])
+                if users_feature_dict.get(source) is not None and users_feature_dict.get(target) is not None:
+                    edge_index_dict['user', relation, 'user'].append([user_id_index_map[source],
+                                                                      user_id_index_map[target]])
             elif relation in ['post']:
                 if edge_index_dict.get(('user', relation, 'tweet')) is None:
                     edge_index_dict['user', relation, 'tweet'] = []
-                if user_id_index_map.get(source) is None:
+                if user_id_index_map.get(source) is None and users_feature_dict.get(source) is not None:
                     user_id_index_map[source] = max_user_index
                     max_user_index += 1
                     user_features.append(users_feature_dict[source])
@@ -205,8 +226,9 @@ def pytorch_edge_build(user_labels_dict, user_splits_dict, users_feature_dict, t
                     max_tweet_index += 1
                     tweet_texts.append(tweets_text_dict[target])
                     tweet_label.append(user_labels_dict.get(source))
-                edge_index_dict['user', relation, 'tweet'].append([user_id_index_map[source],
-                                                                   tweet_id_index_map[target]])
+                if users_feature_dict.get(source) is not None:
+                    edge_index_dict['user', relation, 'tweet'].append([user_id_index_map[source],
+                                                                       tweet_id_index_map[target]])
 
     torch_graph['user'].x = torch.tensor(user_features, dtype=torch.float)
     torch_graph['tweet'].x = tweet_texts
@@ -221,22 +243,31 @@ def pytorch_edge_build(user_labels_dict, user_splits_dict, users_feature_dict, t
 
 def aggregate_tweet_feature():
     model_32 = Doc2Vec.load(doc2vec_model_path + "pretrained_wiki_doc2vec_32.model")
-    model_128 = Doc2Vec.load(doc2vec_model_path + "pretrained_wiki_doc2vec_128.model")
+    tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
+    encoder = AutoModel.from_pretrained(bert_model_path)
 
-    graph = torch.load(predata_file_path + 'graph.pt')
+    graph = torch.load(predata_file_path + 'cache/pre_graph.pt')
 
-    user_tweet_feature = torch.zeros(graph['user'].x.size(0), 128)
+    each_user_tweet = ['' for _ in range(graph['user'].x.size(0))]
     user_tweet_num = torch.zeros(graph['user'].x.size(0))
     for edge in tqdm(graph['user', 'post', 'tweet'].edge_index.t().tolist(), desc='聚合推文信息'):
-        user_tweet_feature[edge[0], :] += torch.tensor(model_128.infer_vector(graph['tweet'].x[edge[1]].split()))
+        each_user_tweet[edge[0]] += graph['tweet'].x[edge[1]]
         user_tweet_num[edge[0]] += 1
+    del graph
+    user_tweet_feature = torch.tensor([])
+    for i, user_tweet in tqdm(enumerate(each_user_tweet), total=len(each_user_tweet), desc='编码每个用户的推文集合'):
+        each_user_tweet_feature = encoder(
+            **tokenizer(user_tweet, return_tensors='pt', truncation=True, max_length=512, padding=True)
+        ).last_hidden_state[:, 0, :][0].unsqueeze(dim=0).tolist()
+        user_tweet_feature = torch.cat((user_tweet_feature, torch.tensor(each_user_tweet_feature)), dim=0)
     torch.save(user_tweet_feature, predata_file_path + 'cache/user_tweet_feature.pt')
     user_tweet_num = torch.where(torch.tensor(user_tweet_num == 0), 1, user_tweet_num)
+    graph = torch.load(predata_file_path + 'cache/pre_graph.pt')
     graph['user'].x = torch.cat((graph['user'].x, user_tweet_feature / user_tweet_num.view(-1, 1)), dim=1)
 
     origin_tweet_feature = []
     augment_tweet_feature = []
-    for text in tqdm(graph['tweet'].x, desc='编码推文'):
+    for text in tqdm(graph['tweet'].x, desc='编码每篇推文'):
         origin_tweet_feature.append(model_32.infer_vector(text.split()))
         augment_tweet_feature.append(model_32.infer_vector(wordnet_paraphrase(text).split()))
     graph['tweet'].x1 = torch.tensor(origin_tweet_feature)
@@ -249,6 +280,7 @@ def aggregate_tweet_feature():
 if __name__ == "__main__":
     dataset_file_path = "/data1/botdet/datasets/Twibot-20-Format/"
     predata_file_path = "./predata/twibot20/"
+    bert_model_path = "/data1/botdet/LLM/bert-base-uncased"
     doc2vec_model_path = "./predata/wiki_doc2vec/"
     if not os.path.exists('./predata'):
         os.mkdir('./predata')
@@ -258,9 +290,12 @@ if __name__ == "__main__":
 
     graph_types_map = {'train': 0, 'val': 1, 'test': 2, 'support': 3}
 
+    collect_file()
     user_feature = get_users_feature()
     tweet_text = get_tweets_feature()
     users_label, users_split = get_node_label_split(load_from_local=True)
 
     pytorch_edge_build(users_label, users_split, user_feature, tweet_text)
+    del user_feature, tweet_text, users_label, users_split
+
     aggregate_tweet_feature()

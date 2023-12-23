@@ -9,7 +9,7 @@ from utils import set_random_seed, super_parament_initial
 from model import RGTModel
 
 
-def train(step, subgraph_loader):
+def train(step, subgraph_loader: NeighborLoader):
     model.train()
 
     total_node_predict = torch.tensor([]).to(device)
@@ -17,7 +17,7 @@ def train(step, subgraph_loader):
     loss_bar = {'loss': [], 'batch_size': []}
     tqdm_bar = tqdm(total=len(subgraph_loader), ncols=125, desc=f'训练模型-{step}')
 
-    for subgraph in subgraph_loader:
+    for subgraph in iter(subgraph_loader):
         train_user_mask = subgraph['user'].batch_size
         node_predict = model(subgraph.to(device))[:train_user_mask]
         node_label = subgraph['user'].node_label[:train_user_mask].long()
@@ -41,14 +41,14 @@ def train(step, subgraph_loader):
 
 
 @torch.no_grad()
-def valid(subgraph_loader):
+def valid(subgraph_loader: NeighborLoader):
     model.eval()
 
     total_node_predict = torch.tensor([]).to(device)
     total_node_label = torch.tensor([]).to(device)
 
     tqdm_bar = tqdm(total=len(subgraph_loader), ncols=125, desc=f'验证模型')
-    for subgraph in subgraph_loader:
+    for subgraph in iter(subgraph_loader):
         valid_user_mask = subgraph['user'].batch_size
         node_predict = model(subgraph.to(device).detach())[:valid_user_mask]
         node_label = subgraph['user'].node_label[:valid_user_mask].long()
@@ -84,7 +84,9 @@ if __name__ == "__main__":
         os.mkdir(model_save_path)
 
     graph = torch.load(predata_file_path + 'graph.pt')
-    del graph['user', 'post', 'tweet']
+    for edge_type in graph.edge_types:
+        if edge_type[0] != edge_type[2]:
+            del graph[edge_type]
 
     kwargs = {'batch_size': 128, 'num_workers': 6, 'persistent_workers': True}
     num_neighbors = {edge_type: [1000] * 5 if edge_type[0] != 'tweet' else [100] * 5 for edge_type in graph.edge_types}

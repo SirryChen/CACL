@@ -190,7 +190,7 @@ def pr_drop_weights(edge_index, node_num, aggr: str = 'sink', k: int = 10):
 
 def drop_edge_weighted(edge_index, edge_weights, p: float, threshold: float = 1.):
     edge_weights = edge_weights / edge_weights.mean() * p
-    edge_weights = edge_weights.where(edge_weights < threshold, torch.ones_like(edge_weights) * threshold)      # FIXME 应该是大于号
+    edge_weights = edge_weights.where(edge_weights < threshold, torch.ones_like(edge_weights) * threshold)
     sel_mask = torch.bernoulli(1. - edge_weights).to(torch.bool)
 
     return edge_index[:, sel_mask]
@@ -214,13 +214,20 @@ def compress_graph(community_ids, partition, node_num_threshold=1500):
         part_dict[partition[user_id]].append(user_id)
     # 找出小规模社区分配为0号社区，重新分配其他社区标号
     community_id_map = {}
-    new_id = 1
+    compress_id = 0
+    max_id = 1
+    compress_num = 0
     for community_id in community_ids:
         if len(part_dict[community_id]) < node_num_threshold:
-            community_id_map[community_id] = 0
+            community_id_map[community_id] = compress_id
+            compress_num += len(part_dict[community_id])
         else:
-            community_id_map[community_id] = new_id
-            new_id += 1
+            community_id_map[community_id] = max_id
+            max_id += 1
+        if compress_num > node_num_threshold:
+            compress_id = max_id
+            max_id += 1
+            compress_num = 0
     new_partition = {}
     for node, comm_id in partition.items():
         new_partition[node] = community_id_map[comm_id]
@@ -235,33 +242,42 @@ def set_random_seed(seed):
 
 
 def super_parament_initial():
-    dataset_name = 'twibot20'
     s_parament = ArgumentParser()
-    if dataset_name == 'twibot22':
-        s_parament.add_argument('--dataset', type=str, default='twibot22', help='使用数据集名称')
-        s_parament.add_argument('--tweet_dim', type=int, default=128, help='推文编码长度')
+    s_parament.add_argument('--dataset', type=str, default='twibot20', help='使用数据集名称')
+    args = s_parament.parse_args()
+    if args.dataset == 'twibot22':
+        s_parament.add_argument('--basic_model', type=str, default="HGT", help='基础模型', choices=['HGT', 'GAT', 'SAGE'])
+        s_parament.add_argument('--des_size', default=768, help='用户描述特征维度')
+        s_parament.add_argument('--tweet_size', default=128, help='用户推文特征维度')
+        s_parament.add_argument('--num_prop_size', default=8, help='用户数字信息维度')
+        s_parament.add_argument('--cat_prop_size', default=8, help='用户布尔信息维度')
+        s_parament.add_argument('--embedding_dim', default=128, help='用户编码长度')
+        s_parament.add_argument('--tweet_dim', type=int, default=32, help='推文编码长度')
         s_parament.add_argument('--hidden_dim', type=int, default=64, help='社区检测模型的隐藏层维度')
         s_parament.add_argument('--output_dim', type=int, default=32, help='社区检测模型的输出层维度')
         s_parament.add_argument('--encoder_hidden_channel', type=int, default=128, help='对比学习的隐藏层维度')
         s_parament.add_argument('--encoder_out_channel', type=int, default=128, help='对比学习的输出层维度')
-        s_parament.add_argument('--num_layer', type=int, default=3, help='图卷积层数')
+        s_parament.add_argument('--num_layer', type=int, default=2, help='图卷积层数')
         s_parament.add_argument('--projector_hidden_size', type=int, default=128, help='投影头的隐藏层维度')
-        s_parament.add_argument('--learning_rate', type=float, default=0.001, help='对比学习模型学习率')
-        s_parament.add_argument('--weight_decay', type=float, default=1e-5, help='对比学习模型优化器超参')
-        s_parament.add_argument('--lr_warmup_epochs', type=int, default=64, help='对比学习模型预热期')
-        s_parament.add_argument('--epochs', type=int, default=128, help='训练次数')
+        s_parament.add_argument('--cl_learning_rate', type=float, default=0.0003, help='对比学习模型学习率')
+        s_parament.add_argument('--weight_decay', type=float, default=3e-5, help='对比学习模型优化器超参')
+        s_parament.add_argument('--lr_warmup_epochs', type=int, default=4, help='对比学习模型预热期')
+        s_parament.add_argument('--ft_learning_rate', type=float, default=0.001, help='微调学习率')
+        s_parament.add_argument('--epochs', type=int, default=200, help='训练次数')
         s_parament.add_argument('--momentum', type=float, default=0.99, help='梯度下降惯性动量')
-        s_parament.add_argument('--tau', type=float, default=0.4, help='对比损失温度参数')
+        s_parament.add_argument('--tau', type=float, default=0.07, help='对比损失温度参数')
         s_parament.add_argument('--tweet_augment_method', type=str, default='wordnet', help='文本增强方法')
         s_parament.add_argument('--max_error_times', type=int, default=5, help='最大错误早停次数')
+        s_parament.add_argument('--alpha', type=int, default=0.01, help='对比学习损失权重系数')
+        s_parament.add_argument('--beta', type=int, default=1, help='分类损失权重系数')
+        s_parament.add_argument('--dropout', type=int, default=0.5, help='dropout')
         s_parament.add_argument('--local_rank', default=0, type=int)
         s_parament.add_argument('--classifier_loss_function', type=str, default='binary', help='分类器训练使用的损失函数',
                                 choices=['binary', 'focal'])
         s_parament.add_argument('--cluster', type=str, default='randomwalk', help='聚类方法',
-                                choices=['kmeans', 'randomwalk', 'hierachical'])
+                                choices=['kmeans', 'randomwalk', 'hierachical', 'k_guide'])
 
-    elif dataset_name == 'twibot20':
-        s_parament.add_argument('--dataset', type=str, default='twibot20', help='使用数据集名称')
+    elif args.dataset == 'twibot20':
         s_parament.add_argument('--basic_model', type=str, default="HGT", help='基础模型', choices=['HGT', 'GAT', 'SAGE'])
         s_parament.add_argument('--des_size', default=768, help='用户描述特征维度')
         s_parament.add_argument('--tweet_size', default=768, help='用户推文特征维度')
@@ -275,15 +291,15 @@ def super_parament_initial():
         s_parament.add_argument('--encoder_out_channel', type=int, default=128, help='对比学习的输出层维度')
         s_parament.add_argument('--num_layer', type=int, default=2, help='图卷积层数')
         s_parament.add_argument('--projector_hidden_size', type=int, default=128, help='投影头的隐藏层维度')
-        s_parament.add_argument('--cl_learning_rate', type=float, default=0.0005, help='对比学习模型学习率')
+        s_parament.add_argument('--cl_learning_rate', type=float, default=0.0003, help='对比学习模型学习率')
         s_parament.add_argument('--weight_decay', type=float, default=3e-5, help='对比学习模型优化器超参')
-        s_parament.add_argument('--lr_warmup_epochs', type=int, default=36, help='对比学习模型预热期')
-        s_parament.add_argument('--ft_learning_rate', type=float, default=0.001, help='微调学习率')
+        s_parament.add_argument('--lr_warmup_epochs', type=int, default=8, help='对比学习模型预热期')
+        s_parament.add_argument('--ft_learning_rate', type=float, default=0.0001, help='微调学习率')
         s_parament.add_argument('--epochs', type=int, default=200, help='训练次数')
         s_parament.add_argument('--momentum', type=float, default=0.99, help='梯度下降惯性动量')
         s_parament.add_argument('--tau', type=float, default=0.07, help='对比损失温度参数')
         s_parament.add_argument('--tweet_augment_method', type=str, default='wordnet', help='文本增强方法')
-        s_parament.add_argument('--max_error_times', type=int, default=5, help='最大错误早停次数')
+        s_parament.add_argument('--max_error_times', type=int, default=10, help='最大错误早停次数')
         s_parament.add_argument('--alpha', type=int, default=0.01, help='对比学习损失权重系数')
         s_parament.add_argument('--beta', type=int, default=1, help='分类损失权重系数')
         s_parament.add_argument('--dropout', type=int, default=0.5, help='dropout')

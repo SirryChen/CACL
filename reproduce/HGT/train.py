@@ -84,9 +84,10 @@ if __name__ == "__main__":
     if not os.path.exists(model_save_path):
         os.mkdir(model_save_path)
 
-    # graph: HeteroData = torch.load(predata_file_path + 'graph.pt')
-    graph: HeteroData = torch.load("/data1/botdet/data_mining_task/code/predata/twibot20/graph.pt")
-    del graph['user', 'post', 'tweet']
+    graph: HeteroData = torch.load(predata_file_path + 'graph.pt')
+    for edge_type in graph.edge_types:
+        if edge_type[0] != edge_type[2]:
+            del graph[edge_type]
 
     kwargs = {'batch_size': 128, 'num_workers': 6, 'persistent_workers': True}
     num_neighbors = {edge_type: [1000] * 5 if edge_type[0] != 'tweet' else [100] * 5 for edge_type in graph.edge_types}
@@ -131,5 +132,5 @@ if __name__ == "__main__":
     print(f'test score: {final_score}')
 
     fine_tune_info = {'score': epoch_score, 'loss': epoch_loss}
-    # with open(model_save_path + 'train_info.json', 'w') as fp:
-    #     json.dump(fine_tune_info, fp, indent=4)
+    with open(model_save_path + 'train_info.json', 'w') as fp:
+        json.dump(fine_tune_info, fp, indent=4)

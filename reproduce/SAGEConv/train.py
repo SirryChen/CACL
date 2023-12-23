@@ -85,7 +85,9 @@ if __name__ == "__main__":
         os.mkdir(model_save_path)
 
     graph: HeteroData = torch.load(predata_file_path + 'graph.pt')
-    del graph['user', 'post', 'tweet']
+    for edge_type in graph.edge_types:
+        if edge_type[0] != edge_type[2]:
+            del graph[edge_type]
 
     kwargs = {'batch_size': 128, 'num_workers': 6, 'persistent_workers': True}
     num_neighbors = {edge_type: [1000] * 5 if edge_type[0] != 'tweet' else [100] * 5 for edge_type in graph.edge_types}

@@ -109,11 +109,7 @@ def preprocess_adj(torch_user_adj, num_user):
     # 计算度矩阵的逆平方根
     degree_matrix_sqrt_inv = torch.pow(degree_matrix, -0.5)
     # 将度矩阵逆平方根转换为对角矩阵
-    degree_matrix_sqrt_inv = torch.diag(degree_matrix_sqrt_inv)
-    # 将度矩阵转为稀疏矩阵
-    nonzero_indices = torch.nonzero(degree_matrix_sqrt_inv)
-    values = degree_matrix_sqrt_inv[nonzero_indices[:, 0], nonzero_indices[:, 1]]
-    degree_matrix_sqrt_inv = torch.sparse_coo_tensor(nonzero_indices.t(), values, (num_user, num_user))
+    degree_matrix_sqrt_inv = torch.diag(degree_matrix_sqrt_inv).to_sparse_coo()
     # 归一化邻接矩阵
     normalized_adj = torch.sparse.mm(torch.sparse.mm(degree_matrix_sqrt_inv, torch_user_adj), degree_matrix_sqrt_inv)
 
@@ -232,16 +228,22 @@ def split_large_partition(partition, node_num_threshold=5000):
     return new_partition
 
 
-def clusters(embedding, edge_index, num_communities, cluster):
+def clusters(embedding, edge_index, num_communities, cluster, ensure_comm_num):
     assert cluster in ['randomwalk', 'k_guide', 'kmeans', 'hierachical'], f'wrong cluster {cluster}'
+    partition = {}
     if cluster == 'randomwalk':
-        return random_walk_cluster(embedding, edge_index, num_communities)
+        partition = random_walk_cluster(embedding, edge_index, num_communities)
     elif cluster == 'k_guide':
-        return k_guide_cluster(embedding, edge_index, num_communities)
+        partition = k_guide_cluster(embedding, edge_index, num_communities)
     elif cluster == 'kmeans':
-        return k_means_cluster(embedding, num_communities)
+        partition = k_means_cluster(embedding, num_communities)
     elif cluster == 'hierachical':
-        return hierarchical_cluster(embedding, num_communities)
+        partition = hierarchical_cluster(embedding, num_communities)
+
+    if ensure_comm_num:
+        if len(set(partition.values())) <= 1:
+            partition = split_large_partition(partition, node_num_threshold=len(partition)//2)
+    return partition
 
 
 def k_means_cluster(embedding: np.array, num_communities):
@@ -317,8 +319,8 @@ def k_guide_cluster(embedding: torch.tensor, edge_index, num_communities):
             belong_to_label = cluster_labels[int(indices[max_edge, indices[max_edge, 0]])]
             cluster_labels[node] = belong_to_label if len(label_same[belong_to_label]) != 1 \
                 else random.choice(community_ids)
-    _, new_partition = compress_graph(community_ids=community_ids, partition=cluster_labels, node_num_threshold=800)
-    return split_large_partition(new_partition, 3000)
+    _, new_partition = compress_graph(community_ids=community_ids, partition=cluster_labels, node_num_threshold=200)
+    return split_large_partition(new_partition, 1000)
 
 
 def random_walk_cluster(embedding: torch.tensor, edge_index, num_communities):
@@ -386,8 +388,8 @@ def random_walk_cluster(embedding: torch.tensor, edge_index, num_communities):
             belong_to_label = cluster_labels[int(indices[max_edge, indices[max_edge, 0]])]
             cluster_labels[node] = belong_to_label if belong_to_label is not None else random.choice(community_ids)
 
-    _, new_partition = compress_graph(community_ids=community_ids, partition=cluster_labels, node_num_threshold=800)
-    return split_large_partition(new_partition, 3000)
+    _, new_partition = compress_graph(community_ids=community_ids, partition=cluster_labels, node_num_threshold=200)
+    return split_large_partition(new_partition, 1000)
 
 
 def init_weight(in_dim, out_dim):

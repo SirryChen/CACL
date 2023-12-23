@@ -74,7 +74,7 @@ if __name__ == "__main__":
     args = s_parament.parse_args()
 
     dataset_name = args.dataset
-    device = torch.device('cuda:5') if torch.cuda.is_available() else torch.device('cpu')
+    device = torch.device('cuda:1') if torch.cuda.is_available() else torch.device('cpu')
 
     predata_file_path = f"../../predata/{dataset_name}/"
     model_save_path = f"./train_result/{dataset_name}/"
@@ -84,7 +84,9 @@ if __name__ == "__main__":
         os.mkdir(model_save_path)
 
     graph = torch.load(predata_file_path + 'graph.pt')
-    del graph['user', 'post', 'tweet']
+    for edge_type in graph.edge_types:
+        if edge_type[0] != edge_type[2]:
+            del graph[edge_type]
 
     kwargs = {'batch_size': 128, 'num_workers': 6, 'persistent_workers': True}
     num_neighbors = {edge_type: [1000] * 5 if edge_type[0] != 'tweet' else [100] * 5 for edge_type in graph.edge_types}
@@ -131,5 +133,5 @@ if __name__ == "__main__":
     print(f'test score: {final_score}')
 
     fine_tune_info = {'score': epoch_score, 'loss': epoch_loss}
-    with open(model_save_path + 'train_info.json', 'w') as fp:
+    with open(model_save_path + 'train_info_1.json', 'w') as fp:
         json.dump(fine_tune_info, fp, indent=4)
