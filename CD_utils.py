@@ -101,19 +101,18 @@ def preprocess_adj(torch_user_adj, num_user):
     @return: 归一化的稀疏邻接矩阵
     """
     # 对角矩阵
-    adj_diag = torch.sparse_coo_tensor(torch.tensor([range(torch_user_adj.size(0))]).repeat(2, 1),
-                                       torch.ones(torch_user_adj.size(0)), (num_user, num_user))
-    torch_user_adj = torch_user_adj + adj_diag
+    adj_diag = torch.eye(torch_user_adj.size(0))
+    torch_user_adj = adj_diag + torch_user_adj
     # 计算度矩阵
-    degree_matrix = torch.sparse.sum(torch_user_adj, dim=0).to_dense()
+    degree_matrix = torch.sum(torch_user_adj, dim=0)
     # 计算度矩阵的逆平方根
     degree_matrix_sqrt_inv = torch.pow(degree_matrix, -0.5)
     # 将度矩阵逆平方根转换为对角矩阵
-    degree_matrix_sqrt_inv = torch.diag(degree_matrix_sqrt_inv).to_sparse_coo()
+    degree_matrix_sqrt_inv = torch.diag(degree_matrix_sqrt_inv)
     # 归一化邻接矩阵
-    normalized_adj = torch.sparse.mm(torch.sparse.mm(degree_matrix_sqrt_inv, torch_user_adj), degree_matrix_sqrt_inv)
+    normalized_adj = torch.mm(torch.mm(degree_matrix_sqrt_inv, torch_user_adj), degree_matrix_sqrt_inv)
 
-    return normalized_adj
+    return normalized_adj.to_sparse_coo()
 
 
 def preprocess_degree(torch_user_adj):
@@ -121,10 +120,9 @@ def preprocess_degree(torch_user_adj):
     degrees = torch.sparse.sum(torch_user_adj, dim=0).to_dense().unsqueeze(dim=1)
     edge_num = torch_user_adj.values().size(0)
     deg_matrix = (1.0 / edge_num) * torch.matmul(degrees, degrees.t())
-    # 将度矩阵转换为稀疏矩阵
-    deg_matrix_sparse = deg_matrix.to_sparse()
 
-    return deg_matrix_sparse
+    # 将度矩阵转换为稀疏矩阵
+    return deg_matrix.to_sparse()
 
 
 def node_sample(torch_user_adj, threshold):
@@ -388,7 +386,7 @@ def random_walk_cluster(embedding: torch.tensor, edge_index, num_communities):
             belong_to_label = cluster_labels[int(indices[max_edge, indices[max_edge, 0]])]
             cluster_labels[node] = belong_to_label if belong_to_label is not None else random.choice(community_ids)
 
-    _, new_partition = compress_graph(community_ids=community_ids, partition=cluster_labels, node_num_threshold=200)
+    _, new_partition = compress_graph(community_ids=community_ids, partition=cluster_labels, node_num_threshold=10)  # FIXME 200
     return split_large_partition(new_partition, 1000)
 
 

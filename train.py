@@ -45,9 +45,11 @@ def train(step, subgraph_loader):
         optimizer_CL.zero_grad()
         total_loss.backward()
         optimizer_CL.step()
-        subgraph_loader.cd_model.cd_encoder_decoder.update_embedding_layer(CLModel.update_cd_model())
+        # subgraph_loader.cd_model.cd_encoder_decoder.update_embedding_layer(CLModel.update_cd_model())
         loss_bar['user_num'].append(subgraph['user'].x.size(0))
         loss_bar['loss'].append(total_loss.to('cpu').detach().item() * loss_bar['user_num'][-1])
+
+        tqdm_bar.set_postfix_str(f'progress: 生成子图')
 
     tqdm_bar.set_postfix(None)
     avg_loss = sum(loss_bar['loss']) / sum(loss_bar['user_num'])
@@ -148,12 +150,12 @@ if __name__ == "__main__":
 
     dataset_name = args.dataset
 
-    device_cd = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+    device_cd = torch.device('cuda:6') if torch.cuda.is_available() else torch.device('cpu')
     device_cl = torch.device('cuda:5') if torch.cuda.is_available() else torch.device('cpu')
 
     predata_file_path = f"./predata/{dataset_name}/"
-    model_save_path = f"./train_result/{dataset_name}/"
-    experiment_result_save_path = f"./train_result/{dataset_name}/dynamic_cd_hard_positive_negative_individual_cl_5/"
+    pretrain_model_save_path = f"./train_result/{dataset_name}/"
+    experiment_result_save_path = f"./train_result/{dataset_name}/dynamic_cd_hard_sample_unsupervised_cl/"
 
     if not os.path.exists(experiment_result_save_path):
         os.mkdir(experiment_result_save_path)
@@ -167,6 +169,7 @@ if __name__ == "__main__":
         if edge_type[0] != edge_type[2]:
             graph[edge_type[2], edge_type[1], edge_type[0]].edge_index = graph[edge_type].edge_index[[1, 0]]
 
+    # twibot-20
     kwargs = {'batch_size': 128, 'num_workers': 6, 'persistent_workers': True}
     num_neighbors = {edge_type: [1000] * 5 if edge_type[0] != 'tweet' else [100] * 5 for edge_type in graph.edge_types}
     train_dataloader = NeighborLoader(graph, num_neighbors=num_neighbors, shuffle=True,
@@ -180,7 +183,8 @@ if __name__ == "__main__":
     test_dataloader = NeighborLoader(graph, num_neighbors=num_neighbors, shuffle=True,
                                      input_nodes=('user', graph['user'].node_split == 2), **kwargs)
 
-    # kwargs = {'batch_size': 100, 'num_workers': 6, 'persistent_workers': True}
+    # twibot-22
+    # kwargs = {'batch_size': 1000, 'num_workers': 6, 'persistent_workers': True}
     # num_neighbors = {edge_type: [5] * 3 if edge_type[0] != 'tweet' else [100] * 3 for edge_type in graph.edge_types}
     # train_dataloader = NeighborLoader(graph, num_neighbors=num_neighbors, shuffle=True,
     #                                   input_nodes=('user', graph['user'].node_split == 0), **kwargs)
@@ -216,9 +220,9 @@ if __name__ == "__main__":
     classifier = Classifier(input_dim=args.encoder_out_channel + args.embedding_dim)
     CLModel = HGcnCLModel(Encoder, Projector, classifier).to(device_cl)
 
+    pretrain_weights = torch.load(pretrain_model_save_path + f"pretrain_cd_model.pth")
     valid(valid_dataset)    # first forward for initializing model
-    train_dataset.cd_model.cd_encoder_decoder.load_state_dict(
-        torch.load(model_save_path + f"pretrain_cd_model_{args.basic_model}.pth"))
+    train_dataset.cd_model.cd_encoder_decoder.load_state_dict(pretrain_weights)
     CLModel.encoder.init_first_layer(train_dataset.cd_model.cd_encoder_decoder.state_dict())
 
     optimizer_CL = AdamW(CLModel.parameters(), lr=args.cl_learning_rate, weight_decay=args.weight_decay)
@@ -231,16 +235,19 @@ if __name__ == "__main__":
     epoch_score = {}
     restrain_flag = 0
     for epoch in range(args.epochs):
-        loss_ = train_hard(epoch, train_dataset)
+        if epoch < args.lr_warmup_epochs:
+            args.alpha = 0.1
+            args.beta = 0.0
+        loss_ = train(epoch, train_dataset)
         score_ = valid(valid_dataset)
         epoch_loss[f'epoch-{epoch}'] = loss_
         epoch_score[f'epoch-{epoch}'] = score_
         if epoch < args.lr_warmup_epochs:
-            args.alpha = 1.0
+            args.alpha = 0.1
             args.beta = 0.0
             continue
         else:
-            args.alpha = 0.1
+            args.alpha = 0.01
             args.beta = 1.0
         if score_[target_name] > best_target:
             torch.save(CDModel.state_dict(), experiment_result_save_path + 'cd_model.pth')
@@ -253,6 +260,7 @@ if __name__ == "__main__":
             if error_times > args.max_error_times:
                 print(f'*** stop at epoch-{epoch} ***')
                 break
+
     CDModel.load_state_dict(torch.load(experiment_result_save_path + 'cd_model.pth'))
     Encoder.load_state_dict(torch.load(experiment_result_save_path + 'encoder.pth'))
     Encoder.dropout = nn.Dropout(0)

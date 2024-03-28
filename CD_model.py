@@ -65,16 +65,11 @@ class ModCDModel(nn.Module):
                                                                                           normalized_adj.to(self.device),
                                                                                           self.cd_config['gamma'])
         if not self.pretrain:
-            new_edge_index = []
             edge_index = self.origin_adj.indices()
-            edge_number = edge_index.size(1)
-            edge_set = set(tuple(edge) for edge in self.origin_adj.indices().t().tolist())
+            new_edge_index = (torch.sigmoid(self.reconstruct) > 0.5).nonzero().t().to('cpu')
 
-            for i, j in (torch.sigmoid(self.reconstruct) > 0.5).nonzero().tolist():
-                if (i, j) not in edge_set:
-                    new_edge_index.append([i, j])
-            new_edge_num = min(edge_number//10, len(new_edge_index))
-            new_edge_index = torch.tensor(random.sample(new_edge_index, new_edge_num)).t()
+            new_edge_num = min(edge_index.size(1) // 10, new_edge_index.size(1))
+            new_edge_index = new_edge_index[:, torch.randperm(len(new_edge_index))[:new_edge_num]]  # 新边重复旧边，后续兼容
 
             # NOTE:返回实际使用的社区分类情况，以及用于图增强的连接预测
             k_partition = clusters(self.node_emb.detach().to('cpu'), edge_index.to('cpu'),

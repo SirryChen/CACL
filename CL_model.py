@@ -9,9 +9,9 @@ from sklearn.metrics import confusion_matrix
 from torch_geometric.data import HeteroData
 from torch.nn.functional import cross_entropy
 from copy import deepcopy
-from utils import drop_feature, feature_drop_weights, compute_page_rank, add_self_loop, tweet_augment
+from utils import drop_feature, feature_drop_weights, compute_page_rank, add_self_loop, tweet_augment, information_entropy
 from CL_utils import compute_hard_loss, compute_pro_loss, unsupervised_cl_loss, traditional_cl_loss, \
-    compute_cross_mean_view_loss, compute_cross_individual_loss
+    compute_cross_mean_view_loss, compute_cross_individual_loss, RGTLayer
 
 
 class MLPProjector(nn.Module):
@@ -96,9 +96,9 @@ class HeteroGraphConvModel(nn.Module):
         node_embedding = {node_type: self.dropout(self.LReLU(self.linear[node_type](feature)))
                           for node_type, feature in node_feature.items()}
         # 卷积、批量归一化
-        for HGT, batch_norm in zip(self.Hetero_Conv_list, self.batch_norms):
-            node_embedding = HGT(node_embedding, edge_index)
-            node_embedding = {node_type: batch_norm(embedding) for node_type, embedding in node_embedding.items()}
+        for Conv, batch_norm in zip(self.Hetero_Conv_list, self.batch_norms):
+            node_embedding = Conv(node_embedding, edge_index)
+            # node_embedding = {node_type: batch_norm(embedding) for node_type, embedding in node_embedding.items()}
 
         node_embedding = {node_type: torch.cat((embedding, node_feature[node_type]), dim=1)
                           for node_type, embedding in node_embedding.items()}
@@ -106,13 +106,15 @@ class HeteroGraphConvModel(nn.Module):
 
     def choice_basic_model(self, in_channels, out_channels, metadata):
         if self.model == "HGT":
-            # return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=2)
-            return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=1)
+            # return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=1)
+            return HGTConv(in_channels=in_channels, out_channels=out_channels, metadata=metadata, heads=2, group='sum')
         elif self.model == "GAT":
             return HeteroConv({edge_type: GATConv((-1, -1), out_channels, add_self_loops=False)
                                for edge_type in metadata[1]}, aggr='sum')
         elif self.model == "SAGE":
             return HeteroConv({edge_type: SAGEConv((-1, -1), out_channels) for edge_type in metadata[1]}, aggr='sum')
+        elif self.model == "RGT":
+            return RGTLayer(num_edge_type=len(metadata[1]), in_channel=in_channels, out_channel=out_channels)
 
     def init_weight(self):
         for module in self.modules():
@@ -138,8 +140,8 @@ class HGcnCLModel(nn.Module):
         self.projector = projector
         self.classifier = classifier
 
-    def forward(self, node_features):
-        node_embeddings = self.encoder(node_features)
+    def forward(self, graph):
+        node_embeddings = self.encoder(graph)
         node_projections = self.projector(node_embeddings)
         if self.classifier is not None:
             node_predicts = self.classifier(node_embeddings['user'])
@@ -149,6 +151,9 @@ class HGcnCLModel(nn.Module):
 
     def update_cd_model(self):
         return self.encoder.state_dict()
+
+    def get_node_embeddings(self, node_features):
+        return self.encoder(node_features)
 
 
 class Classifier(nn.Module):
@@ -229,6 +234,8 @@ class SubGraphDataset:
         self.cd_model = cd_model
         self.dataloader = dataloader
         self.init_cd_model()
+        self.entropy_list = []
+        self.comm_num = []
 
     def __len__(self):
         return len(self.dataloader)
@@ -260,11 +267,21 @@ class SubGraphDataset:
                                                     [False] * (graph['user'].x.size(0) - graph['user'].batch_size))
             new_edge_index, k_partition = self.cd_model(graph)
             match_pair = self.cd_model.match_community_pair(k_partition)
+            entropy_batch = []
             for comm_1, comm_2 in match_pair.items():
                 subgraph_1 = generate_subgraph(graph, comm_1, k_partition, new_edge_index)
                 subgraph_2 = generate_subgraph(graph, comm_2, k_partition, new_edge_index)
+
+                # node_label_a = subgraph_1['user'].node_label
+                # node_label_b = subgraph_2['user'].node_label
+                # batch_user_mask_a = subgraph_1['user'].batch_mask
+                # batch_user_mask_b = subgraph_2['user'].batch_mask
+                # entropy_batch.append((information_entropy(node_label_a[batch_user_mask_a].to('cpu').numpy())
+                #                       + information_entropy(node_label_b[batch_user_mask_b].to('cpu').numpy()))/2)
                 yield subgraph_1, subgraph_2
             tqdm_bar.update(1)
+            # self.entropy_list.append(entropy_batch)
+            # self.comm_num.append(len(match_pair)*2)
 
     def get_loss_weight(self):
         node_label = torch.tensor(self.graph['user'].node_label)
@@ -283,19 +300,23 @@ class SubGraphDataset:
             else:
                 in_channel[node_type] = self.graph[node_type].x.size(-1)
         return in_channel
+    
+    def get_comm_change(self):
+        return self.entropy_list, self.comm_num
 
 
 def compute_loss(emb1, emb2, pred, label, split, tau, alpha=0.01, beta=1):
-    # cl_loss = compute_pro_loss(emb1, emb2, label, split, tau)                                    # 改进的对比损失函数
-    # cl_loss = compute_hard_loss(emb1, emb2, label, split, positive_bot, positive_human, tau)  # 同时考虑正负难样本
+    # cl_loss = 0                                                                                 # 无对比损失
     cl_loss = unsupervised_cl_loss(emb1, emb2, split, tau)                                    # 无监督的对比损失函数
     # cl_loss = traditional_cl_loss(emb1, emb2, label, split, tau)                              # 传统的有监督对比损失函数
+    # cl_loss = compute_pro_loss(emb1, emb2, label, split, tau)                                   # 改进的对比损失
     if pred is not None:
         train_mask = split == 0
         # bot_num = torch.sum(label[train_mask] == 1)
         # human_num = torch.sum(label[train_mask] == 0)
         # weight = torch.tensor([bot_num/(bot_num+human_num), human_num/(bot_num+human_num)]).to(pred.device)
         # weight = torch.tensor([2, 5], dtype=torch.float).to(pred.device)
+        # pred_loss = cross_entropy(pred[train_mask], label[train_mask], weight=weight)
         pred_loss = cross_entropy(pred[train_mask], label[train_mask])
         loss = alpha * cl_loss + beta * pred_loss
         # conf_matrix = confusion_matrix(label[train_mask].to('cpu'), torch.argmax(pred[train_mask].to('cpu'), dim=1))
@@ -303,6 +324,40 @@ def compute_loss(emb1, emb2, pred, label, split, tau, alpha=0.01, beta=1):
         return loss
     else:
         return cl_loss
+
+
+def compute_cross_view_loss_experiment(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, pred_b,
+                                       label_a, label_b, tau, alpha, beta, mean_flag=True):
+    contrastive_loss_a, p_sim_a, n_sim_a = compute_cross_individual_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2,
+                                                                         pred_a, label_a, label_b, tau)
+    contrastive_loss_b, p_sim_b, n_sim_b = compute_cross_individual_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
+                                                                         pred_b, label_b, label_a, tau)
+
+    contrastive_loss = (contrastive_loss_a + contrastive_loss_b) / 2
+    # weight = torch.tensor([2, 5], dtype=torch.float).to(emb_a_1.device)       # twibot-22
+    # weight = torch.tensor([3, 2], dtype=torch.float).to(emb_a_1.device)       # cresci-15
+    # prediction_loss = cross_entropy(pred_a, label_a, weight=weight)
+    prediction_loss = cross_entropy(pred_a, label_a)
+
+    total_loss = alpha * contrastive_loss + beta * prediction_loss
+
+    norms = torch.norm(emb_a_1, dim=1, keepdim=True)
+    unit_vectors_a = emb_a_1 / norms
+    similarity_matrix = torch.matmul(unit_vectors_a, unit_vectors_a.T)
+    sim_a = (torch.sum(similarity_matrix) - similarity_matrix.shape[0]) / (similarity_matrix.shape[0]
+                                                                           * (similarity_matrix.shape[0]-1))
+
+    norms = torch.norm(emb_b_1, dim=1, keepdim=True)
+    unit_vectors_b = emb_a_1 / norms
+    similarity_matrix = torch.matmul(unit_vectors_b, unit_vectors_b.T)
+    sim_b = (torch.sum(similarity_matrix) - similarity_matrix.shape[0]) / (similarity_matrix.shape[0]
+                                                                           * (similarity_matrix.shape[0]-1))
+
+    similarity_matrix = torch.matmul(unit_vectors_a, unit_vectors_b.T)
+    sim_ab = (torch.sum(similarity_matrix) - similarity_matrix.shape[0]) / (similarity_matrix.shape[0]
+                                                                           * (similarity_matrix.shape[0]-1))
+
+    return total_loss, (p_sim_a + p_sim_b)/2, (n_sim_a + n_sim_b)/2, (sim_a + sim_b)/2, sim_ab
 
 
 def compute_cross_view_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, pred_b,
@@ -313,12 +368,15 @@ def compute_cross_view_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, pred_b,
         contrastive_loss_b = compute_cross_mean_view_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
                                                           pred_b, label_b, label_a, tau)
     else:
-        contrastive_loss_a = compute_cross_individual_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2,
-                                                           pred_a, label_a, label_b, tau)
-        contrastive_loss_b = compute_cross_individual_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
-                                                           pred_b, label_b, label_a, tau)
+        contrastive_loss_a, _, _ = compute_cross_individual_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2,
+                                                                             pred_a, label_a, label_b, tau)
+        contrastive_loss_b, _, _ = compute_cross_individual_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
+                                                                             pred_b, label_b, label_a, tau)
 
     contrastive_loss = (contrastive_loss_a + contrastive_loss_b) / 2
+    # weight = torch.tensor([2, 5], dtype=torch.float).to(emb_a_1.device)       # twibot-22
+    # weight = torch.tensor([3, 2], dtype=torch.float).to(emb_a_1.device)       # cresci-15
+    # prediction_loss = cross_entropy(pred_a, label_a, weight=weight)
     prediction_loss = cross_entropy(pred_a, label_a)
 
     total_loss = alpha * contrastive_loss + beta * prediction_loss
@@ -326,30 +384,26 @@ def compute_cross_view_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, pred_b,
     return total_loss
 
 
-# 计算节点的PageRank centrality并执行自适应增强
-def adaptive_augment(graph: HeteroData, drop_feature_rate=0.2, random_co=0.02):
-    augment_graph1 = deepcopy(graph)
+def adaptive_augment(graph: HeteroData, drop_feature_rate=0.2):
+    augment_graph1 = graph
     augment_graph2 = deepcopy(graph)
+
+    # Link Prediction for edge augmentation
     for edge_type in graph.edge_types:
         if hasattr(graph[edge_type], 'augmented_edge_index'):
-            augment_graph1[edge_type].edge_index = augment_graph1[edge_type].edge_index
             augment_graph2[edge_type].edge_index = augment_graph2[edge_type].augmented_edge_index
             del augment_graph1[edge_type].augmented_edge_index, augment_graph2[edge_type].augmented_edge_index
 
-    # feature增强，对图1进行随机增强
+    # Synonymy Substitution for text augmentation
     for node_type in graph.node_types:
         if node_type == 'tweet':
             augment_graph1['tweet'].x = augment_graph1['tweet'].x1
             augment_graph2['tweet'].x = augment_graph2['tweet'].x2
+            # augment_graph2['tweet'].x = augment_graph2['tweet'].x1
             del augment_graph1['tweet'].x1, augment_graph1['tweet'].x2
             del augment_graph2['tweet'].x1, augment_graph2['tweet'].x2
-        elif augment_graph1[node_type].x.size(0) > 0:
-            col_max, _ = torch.max(augment_graph1[node_type].x, dim=0)
-            col_min, _ = torch.min(augment_graph1[node_type].x, dim=0)
-            random_matrix = random_co * (torch.rand(augment_graph1[node_type].x.size()) * (col_max - col_min) + col_min)
-            augment_graph1[node_type].x = augment_graph1[node_type].x + random_matrix
 
-    # feature增强，对图2基于pagerank自适应增强
+    # Node Feature Shifting based on PageRank
     augmented_edge_type = []
     for edge_type in graph.edge_types:
         if edge_type[0] == edge_type[2] and (edge_type[0] not in augmented_edge_type) \
@@ -360,6 +414,28 @@ def adaptive_augment(graph: HeteroData, drop_feature_rate=0.2, random_co=0.02):
             augment_graph2[edge_type[0]].x = drop_feature(augment_graph2[edge_type[0]].x,
                                                           feature_weight, drop_feature_rate)
             augmented_edge_type.append(edge_type[0])
+
+    # NOTE experiment no text
+    # for edge_type in graph.edge_types:
+    #     if edge_type[0] == 'tweet' or edge_type[2] == 'tweet':
+    #         del augment_graph1[edge_type], augment_graph2[edge_type]
+    
+    # NOTE experiment no metadata
+    # augment_graph1['user'].x[:, :6] = 0.0
+    # augment_graph2['user'].x[:, :6] = 0.0
+    
+    # NOTE experiment no heterogeneous
+    # for edge_type in graph.edge_types:
+    #     if edge_type[0] == 'tweet' or edge_type[2] == 'tweet':
+    #         del augment_graph1[edge_type], augment_graph2[edge_type]
+    # hetero_edge = []
+    # for edge_type in graph.edge_types:
+    #     if edge_type[0] == edge_type[2]:
+    #         hetero_edge.append(edge_type)
+    # for edge_type in hetero_edge[1:]:
+    #     augment_graph1[hetero_edge[0]].edge_index = torch.cat((augment_graph1[hetero_edge[0]].edge_index, augment_graph1[edge_type].edge_index), dim=1)
+    #     augment_graph2[hetero_edge[0]].edge_index = torch.cat((augment_graph2[hetero_edge[0]].edge_index, augment_graph2[edge_type].edge_index), dim=1)
+    #     del augment_graph1[edge_type], augment_graph2[edge_type]
 
     return augment_graph1, augment_graph2
 

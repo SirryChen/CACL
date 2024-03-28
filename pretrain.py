@@ -34,7 +34,7 @@ def train(step):
                                  f"mat: {score_['confusion_matrix'][0].tolist()}"
                                  f"{score_['confusion_matrix'][1].tolist()}")
         tqdm_bar.update(1)
-    train_score_['f1-score'] = sum(train_score_['f1-score']/len(train_score_['f1-score']))
+    train_score_['f1-score'] = sum(train_score_['f1-score'])/len(train_score_['f1-score'])
     train_score_['auc'] = sum(train_score_['auc'])/len(train_score_['auc'])
     train_score_['ap'] = sum(train_score_['ap'])/len(train_score_['ap'])
     tqdm_bar.set_postfix_str(f"loss: {round(loss_ / len(dataloader), 3)}, "
