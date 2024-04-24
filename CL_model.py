@@ -15,7 +15,8 @@ from CL_utils import compute_hard_loss, compute_pro_loss, unsupervised_cl_loss, 
 
 
 class MLPProjector(nn.Module):
-    """MLP used for predictor. The MLP has one hidden layer.
+    """
+    MLP used for predictor. The MLP has one hidden layer.
     @input_size (int): Size of input features.
     @output_size (int): Size of output features.
     @hidden_size (int, optional): Size of hidden layer. (default: :obj:`4096`).
@@ -348,14 +349,14 @@ def compute_cross_view_loss_experiment(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_
                                                                            * (similarity_matrix.shape[0]-1))
 
     norms = torch.norm(emb_b_1, dim=1, keepdim=True)
-    unit_vectors_b = emb_a_1 / norms
+    unit_vectors_b = emb_b_1 / norms
     similarity_matrix = torch.matmul(unit_vectors_b, unit_vectors_b.T)
     sim_b = (torch.sum(similarity_matrix) - similarity_matrix.shape[0]) / (similarity_matrix.shape[0]
                                                                            * (similarity_matrix.shape[0]-1))
 
     similarity_matrix = torch.matmul(unit_vectors_a, unit_vectors_b.T)
     sim_ab = (torch.sum(similarity_matrix) - similarity_matrix.shape[0]) / (similarity_matrix.shape[0]
-                                                                           * (similarity_matrix.shape[0]-1))
+                                                                            * (similarity_matrix.shape[0]-1))
 
     return total_loss, (p_sim_a + p_sim_b)/2, (n_sim_a + n_sim_b)/2, (sim_a + sim_b)/2, sim_ab
 
@@ -369,9 +370,9 @@ def compute_cross_view_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, pred_b,
                                                           pred_b, label_b, label_a, tau)
     else:
         contrastive_loss_a, _, _ = compute_cross_individual_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2,
-                                                                             pred_a, label_a, label_b, tau)
+                                                                 pred_a, label_a, label_b, tau)
         contrastive_loss_b, _, _ = compute_cross_individual_loss(emb_b_1, emb_b_2, emb_a_1, emb_a_2,
-                                                                             pred_b, label_b, label_a, tau)
+                                                                 pred_b, label_b, label_a, tau)
 
     contrastive_loss = (contrastive_loss_a + contrastive_loss_b) / 2
     # weight = torch.tensor([2, 5], dtype=torch.float).to(emb_a_1.device)       # twibot-22
@@ -433,8 +434,10 @@ def adaptive_augment(graph: HeteroData, drop_feature_rate=0.2):
     #     if edge_type[0] == edge_type[2]:
     #         hetero_edge.append(edge_type)
     # for edge_type in hetero_edge[1:]:
-    #     augment_graph1[hetero_edge[0]].edge_index = torch.cat((augment_graph1[hetero_edge[0]].edge_index, augment_graph1[edge_type].edge_index), dim=1)
-    #     augment_graph2[hetero_edge[0]].edge_index = torch.cat((augment_graph2[hetero_edge[0]].edge_index, augment_graph2[edge_type].edge_index), dim=1)
+    #     augment_graph1[hetero_edge[0]].edge_index = \
+    #         torch.cat((augment_graph1[hetero_edge[0]].edge_index, augment_graph1[edge_type].edge_index), dim=1)
+    #     augment_graph2[hetero_edge[0]].edge_index = \
+    #         torch.cat((augment_graph2[hetero_edge[0]].edge_index, augment_graph2[edge_type].edge_index), dim=1)
     #     del augment_graph1[edge_type], augment_graph2[edge_type]
 
     return augment_graph1, augment_graph2

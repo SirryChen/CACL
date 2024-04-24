@@ -55,8 +55,8 @@ class ModCDModel(nn.Module):
 
     def forward(self, graph: HeteroData):
         """
-        @param graph: 完整图
-        @return: 增强的边，划分的子图
+        @param graph: full graph(完整图)
+        @return: enhanced edge list, split graph list(增强的边，划分的子图)
         """
         user_feature, adj, self.deg_matrix_sparse, param = preprocess_graph(graph)
         normalized_adj, self.origin_adj = adj
@@ -183,13 +183,13 @@ class CDEncoderDecoder(nn.Module):
 
 def cd_loss(predicts, labels, degree_matrix, clusters_distance, pos_weights, beta):
     """
-    计算损失
-    @param predicts: 重构的邻接矩阵，n*n tensor密集矩阵
-    @param labels: 原始的邻接矩阵，稀疏矩阵
-    @param degree_matrix: 稀疏的度矩阵
+    compute the loss
+    @param predicts: reconstructed adjacency matrix(重构的邻接矩阵，n*n tensor密集矩阵)
+    @param labels: original adjacency matrix(原始的邻接矩阵，稀疏矩阵)
+    @param degree_matrix: sparse degree matrix(稀疏的度矩阵)
     @param clusters_distance:
     @param pos_weights: 应对不平衡的边的情况，使得存在边的损失在训练中被加权，以处理类别不平衡
-    @param beta: 模块度损失权重系数
+    @param beta: modularity loss weight coefficient(模块度损失权重系数)
     @return:
     """
     node_num = labels.values().size(0)

@@ -7,7 +7,6 @@ from tqdm import tqdm
 from torch.optim import AdamW
 from CD_model import ModCDModel
 from torch_geometric.data import HeteroData
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch_geometric.loader import NeighborLoader
 from utils import set_random_seed, super_parament_initial
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, matthews_corrcoef
@@ -16,6 +15,9 @@ from CL_model import HeteroGraphConvModel, MLPProjector, HGcnCLModel, Classifier
 
 
 def train(step, subgraph_loader):
+    """
+    without hard sample mining
+    """
     CLModel.train()
 
     loss_bar = {'loss': [], 'user_num': []}
@@ -25,16 +27,16 @@ def train(step, subgraph_loader):
     for graph_th, subgraph in enumerate(subgraph_loader.subgraph(tqdm_bar)):
         batch_user_mask = subgraph['user'].batch_mask
 
-        tqdm_bar.set_postfix_str(f'progress: 自适应图增强')
+        tqdm_bar.set_postfix_str(f'progress: graph augmentation')
         augmented_graph1, augmented_graph2 = adaptive_augment(subgraph)
         augmented_graph1 = augmented_graph1.to(device_cl).detach()
         augmented_graph2 = augmented_graph2.to(device_cl).detach()
 
-        tqdm_bar.set_postfix_str(f'progress: 图编码')
+        tqdm_bar.set_postfix_str(f'progress: graph encode')
         node_projections_1, node_prediction = CLModel(augmented_graph1)
         node_projections_2, _ = CLModel(augmented_graph2)
 
-        tqdm_bar.set_postfix_str(f'progress: 损失计算更新')
+        tqdm_bar.set_postfix_str(f'progress: computing loss')
         node_label = subgraph['user'].node_label.to(device_cl)
         node_split = subgraph['user'].node_split.to(device_cl)
         total_loss = compute_loss(node_projections_1['user'][batch_user_mask],
@@ -45,21 +47,23 @@ def train(step, subgraph_loader):
         optimizer_CL.zero_grad()
         total_loss.backward()
         optimizer_CL.step()
-        # subgraph_loader.cd_model.cd_encoder_decoder.update_embedding_layer(CLModel.update_cd_model())
+        subgraph_loader.cd_model.cd_encoder_decoder.update_embedding_layer(CLModel.update_cd_model())
         loss_bar['user_num'].append(subgraph['user'].x.size(0))
         loss_bar['loss'].append(total_loss.to('cpu').detach().item() * loss_bar['user_num'][-1])
 
-        tqdm_bar.set_postfix_str(f'progress: 生成子图')
+        tqdm_bar.set_postfix_str(f'progress: generating subgraph')
 
     tqdm_bar.set_postfix(None)
     avg_loss = sum(loss_bar['loss']) / sum(loss_bar['user_num'])
     tqdm_bar.set_postfix_str(f'average loss: {avg_loss}')
-    # lr_scheduler.step()
 
     return avg_loss
 
 
 def train_hard(step, subgraph_loader):
+    """
+    with hard sample mining
+    """
     CLModel.train()
 
     loss_bar = {'loss': [], 'user_num': []}
@@ -70,7 +74,7 @@ def train_hard(step, subgraph_loader):
         batch_user_mask_a = subgraph_a['user'].batch_mask
         batch_user_mask_b = subgraph_b['user'].batch_mask
 
-        tqdm_bar.set_postfix_str(f'progress: 自适应图增强')
+        tqdm_bar.set_postfix_str(f'progress: graph augmentation')
         augment_graph_a_1, augment_graph_a_2 = adaptive_augment(copy.deepcopy(subgraph_a))
         augment_graph_b_1, augment_graph_b_2 = adaptive_augment(copy.deepcopy(subgraph_b))
 
@@ -79,13 +83,13 @@ def train_hard(step, subgraph_loader):
         augment_graph_b_1 = augment_graph_b_1.to(device_cl).detach()
         augment_graph_b_2 = augment_graph_b_2.to(device_cl).detach()
 
-        tqdm_bar.set_postfix_str(f'progress: 图编码')
+        tqdm_bar.set_postfix_str(f'progress: graph encode')
         node_projections_a_1, node_prediction_a = CLModel(augment_graph_a_1)
         node_projections_a_2, _ = CLModel(augment_graph_a_2)
         node_projections_b_1, node_prediction_b = CLModel(augment_graph_b_1)
         node_projections_b_2, _ = CLModel(augment_graph_b_2)
 
-        tqdm_bar.set_postfix_str(f'progress: 损失计算更新')
+        tqdm_bar.set_postfix_str(f'progress: computing loss')
         node_label_a = subgraph_a['user'].node_label.to(device_cl)
         node_label_b = subgraph_b['user'].node_label.to(device_cl)
         total_loss = compute_cross_view_loss(node_projections_a_1['user'][batch_user_mask_a],
@@ -103,12 +107,11 @@ def train_hard(step, subgraph_loader):
         loss_bar['user_num'].append(subgraph_a['user'].x.size(0) + subgraph_b['user'].x.size(0))
         loss_bar['loss'].append(total_loss.to('cpu').detach().item() * loss_bar['user_num'][-1])
 
-        tqdm_bar.set_postfix_str(f'progress: 生成子图')
+        tqdm_bar.set_postfix_str(f'progress: generating subgraph')
 
     tqdm_bar.set_postfix(None)
     avg_loss = sum(loss_bar['loss']) / sum(loss_bar['user_num'])
     tqdm_bar.set_postfix_str(f'average loss: {avg_loss}')
-    # lr_scheduler.step()
 
     return avg_loss
 
@@ -119,7 +122,7 @@ def valid(subgraph_loader):
 
     total_node_predict = torch.tensor([]).to(device_cl)
     total_node_label = torch.tensor([]).to(device_cl)
-    tqdm_bar = tqdm(total=len(subgraph_loader), ncols=125, desc='验证模型')
+    tqdm_bar = tqdm(total=len(subgraph_loader), ncols=125, desc='valid')
 
     for graph_th, subgraph in enumerate(subgraph_loader.subgraph(tqdm_bar)):
         subgraph['tweet'].x = subgraph['tweet'].x1
@@ -155,7 +158,7 @@ if __name__ == "__main__":
 
     predata_file_path = f"./predata/{dataset_name}/"
     pretrain_model_save_path = f"./train_result/{dataset_name}/"
-    experiment_result_save_path = f"./train_result/{dataset_name}/dynamic_cd_hard_sample_unsupervised_cl/"
+    experiment_result_save_path = f"./train_result/{dataset_name}/dynamic_cd_hard_sample_cl/"
 
     if not os.path.exists(experiment_result_save_path):
         os.mkdir(experiment_result_save_path)
@@ -170,7 +173,7 @@ if __name__ == "__main__":
             graph[edge_type[2], edge_type[1], edge_type[0]].edge_index = graph[edge_type].edge_index[[1, 0]]
 
     # twibot-20
-    kwargs = {'batch_size': 128, 'num_workers': 6, 'persistent_workers': True}
+    kwargs = {'batch_size': 1000, 'num_workers': 6, 'persistent_workers': True}
     num_neighbors = {edge_type: [1000] * 5 if edge_type[0] != 'tweet' else [100] * 5 for edge_type in graph.edge_types}
     train_dataloader = NeighborLoader(graph, num_neighbors=num_neighbors, shuffle=True,
                                       input_nodes=('user', graph['user'].node_split == 0), **kwargs)
@@ -226,7 +229,6 @@ if __name__ == "__main__":
     CLModel.encoder.init_first_layer(train_dataset.cd_model.cd_encoder_decoder.state_dict())
 
     optimizer_CL = AdamW(CLModel.parameters(), lr=args.cl_learning_rate, weight_decay=args.weight_decay)
-    # lr_scheduler = CosineAnnealingLR(optimizer_CL, args.epochs//10, 0)
 
     best_target = 0
     target_name = 'f1'
@@ -238,7 +240,7 @@ if __name__ == "__main__":
         if epoch < args.lr_warmup_epochs:
             args.alpha = 0.1
             args.beta = 0.0
-        loss_ = train(epoch, train_dataset)
+        loss_ = train_hard(epoch, train_dataset)
         score_ = valid(valid_dataset)
         epoch_loss[f'epoch-{epoch}'] = loss_
         epoch_score[f'epoch-{epoch}'] = score_
@@ -247,7 +249,7 @@ if __name__ == "__main__":
             args.beta = 0.0
             continue
         else:
-            args.alpha = 0.01
+            args.alpha = 0.14
             args.beta = 1.0
         if score_[target_name] > best_target:
             torch.save(CDModel.state_dict(), experiment_result_save_path + 'cd_model.pth')

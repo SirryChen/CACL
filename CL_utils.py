@@ -1,5 +1,4 @@
 import torch
-from torch.nn.functional import cross_entropy
 from torch.nn.functional import cosine_similarity, normalize
 from torch_geometric.nn.conv import TransformerConv
 
@@ -372,8 +371,8 @@ def compute_cross_individual_loss(emb_a_1, emb_a_2, emb_b_1, emb_b_2, pred_a, la
         loss_2 = torch.div((self_sim + positive_sim_2), (self_sim + positive_sim_2 + negative_sim_2))
         contrastive_loss += (- torch.log(loss_1) - torch.log(loss_2)) * 0.5
 
-        p_sim.append((positive_sim_1 + positive_sim_2)/2)
-        n_sim.append((negative_sim_1 + negative_sim_2)/2)
+        p_sim.append((positive_sim_1/label_b.size(0) + positive_sim_2/label_b.size(0))/2)
+        n_sim.append((negative_sim_1/label_a.size(0) + negative_sim_2/label_a.size(0))/2)
 
     contrastive_loss = contrastive_loss / label_a.size(0)
 

@@ -13,9 +13,10 @@ from utils import compress_graph
 
 def load_user_graph(graph: HeteroData):
     """
-    考虑用户之间的关系，提取用户子图，并将图转为无向图
-    @param graph: torch异质图格式的图
-    @return: 用户邻接稀疏矩阵(COO格式)，用户的特征向量(n*m torch.tensor)
+    Consider the relationships between users, extract user subgraphs, and convert the graphs to undirected graphs
+    (考虑用户之间的关系，提取用户子图，并将图转为无向图)
+    @param graph: graph in torch heterogeneous graph format(torch异质图格式的图)
+    @return: sparse adjacency matrix of users in coo format, user features(用户邻接稀疏矩阵(COO格式)，用户的特征向量(n*m torch.tensor))
     """
     total_edge_index = torch.tensor([[], []])
     for edge_type in graph.edge_types:
@@ -93,12 +94,13 @@ def sparsification(adj_louvain, s=5):
     return s_adj_louvain
 
 
-def preprocess_adj(torch_user_adj, num_user):
+def preprocess_adj(torch_user_adj):
     """
-    归一化处理邻接矩阵，避免邻接矩阵和特征矩阵内积相乘改变特征原本的分布
-    @param torch_user_adj: torch格式的稀疏化邻接矩阵
-    @param num_user: 用户节点个数
-    @return: 归一化的稀疏邻接矩阵
+    Normalize the adjacency matrix to prevent changing the original distribution of features
+    when performing matrix multiplication with the feature matrix
+    (归一化处理邻接矩阵，避免邻接矩阵和特征矩阵内积相乘改变特征原本的分布)
+    @param torch_user_adj: sparse adjacency matrix in torch format(torch格式的稀疏化邻接矩阵)
+    @return: normalized sparse adjacency matrix(归一化的稀疏邻接矩阵)
     """
     # 对角矩阵
     adj_diag = torch.eye(torch_user_adj.size(0))
@@ -127,9 +129,10 @@ def preprocess_degree(torch_user_adj):
 
 def node_sample(torch_user_adj, threshold):
     """
-    返回抽取的节点索引、抽取节点构成的稀疏邻接矩阵
-    @param torch_user_adj: torch.sparse_coo_tensor格式用户邻接矩阵
-    @param threshold: 抽取节点个数阈值
+    Return the indices of the extracted nodes and the sparse adjacency matrix formed by the extracted nodes
+    (返回抽取的节点索引、抽取节点构成的稀疏邻接矩阵)
+    @param torch_user_adj: User adjacency matrix in torch.sparse_coo_tensor format(torch.sparse_coo_tensor格式用户邻接矩阵)
+    @param threshold: threshold for the number of extracted nodes(抽取节点个数阈值)
     @return:
     """
     node_probability = torch.sparse.sum(torch_user_adj, dim=0).to_dense().squeeze()
@@ -148,9 +151,10 @@ def node_sample(torch_user_adj, threshold):
 
 def preprocess_val_graph(graph: HeteroData, val_ratio):
     """
-    只保留图中关于user部分，并返回用于验证link prediction的两幅图
-    @param graph: 原始完整图
-    @param val_ratio: 用于预测的边的数量
+    Only retain the part of the graph related to users, and return two graphs for validating link prediction
+    (只保留图中关于user部分，并返回用于验证link prediction的两幅图)
+    @param graph: full graph(原始完整图)
+    @param val_ratio: number of edges for prediction(用于预测的边的数量)
     """
     val_graph = HeteroData()
     val_graph['user'].x = graph['user'].x
@@ -226,7 +230,7 @@ def split_large_partition(partition, node_num_threshold=5000):
     return new_partition
 
 
-def clusters(embedding, edge_index, num_communities, cluster, ensure_comm_num):
+def clusters(embedding, edge_index, num_communities, cluster, ensure_comm_num=False):
     assert cluster in ['randomwalk', 'k_guide', 'kmeans', 'hierachical'], f'wrong cluster {cluster}'
     partition = {}
     if cluster == 'randomwalk':
