@@ -23,7 +23,7 @@ The steps to reimplement this work mainly contain:
   - After obtaining preprocessed data and pretrained community-aware module weight, use `train.py` to train the full model.
   - Hyperparameters can be adjusted in the function `super_parament_initial()` in `utils.py`.
 
-4. Test  
+- Test  
 After training the model using `train.py`, the test results will be shown and saved.
 
 ## Datasets
