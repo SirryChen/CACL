@@ -1,5 +1,7 @@
 # CACL: Community-Aware Heterogeneous Graph Contrastive Learning for Social Media Bot Detection
 
+>Accepted by ACL 2024 Findings
+
 CACL is a Community-Aware Heterogeneous Graph Contrastive Learning framework and we apply it to social media bot detection.
 
 The implementation of CACL is mainly based on [Pytorch](https://github.com/pytorch/pytorch) and [Pytorch Geometric](https://github.com/rusty1s/pytorch_geometric) API.
