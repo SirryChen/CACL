@@ -75,6 +75,11 @@ The details of other optional hyperparameters can be found in the function `supe
 Please consider citing the following paper when using our code for your application.
 
 ```bibtex
-
+@article{chen2024cacl,
+  title={CACL: Community-Aware Heterogeneous Graph Contrastive Learning for Social Media Bot Detection},
+  author={Chen, Sirry and Feng, Shuo and Liang, Songsong and Zong, Chen-Chen and Li, Jing and Li, Piji},
+  journal={arXiv preprint arXiv:2405.10558},
+  year={2024}
+}
 ```
 
