@@ -57,7 +57,7 @@ python3 pretrain.py --dataset cresci15 --basic_model HGT
 
 - Train the CACL with HGT
 ```bash
-python3 pretrain.py --dataset cresci15 --basic_model HGT --max_error_times 5
+python3 train.py --dataset cresci15 --basic_model HGT --max_error_times 5
 ```
 
 Here are some key options of the hyperparameters
